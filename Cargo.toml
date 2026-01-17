@@ -17,6 +17,7 @@ members = [
     "utils",
     "webserver-openapi",
     "integration-tests",
+    "tofu",
 ]
 
 [workspace.package]
