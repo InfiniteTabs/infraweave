@@ -142,7 +142,7 @@ impl CloudProvider for AzureCloudProvider {
     async fn get_job_status(&self, job_id: &str) -> Result<Option<JobStatus>, anyhow::Error> {
         match crate::run_function(
             &self.function_endpoint,
-            &crate::get_job_status_query(job_id),
+            &env_defs::get_job_status_event(job_id),
             &self.project_id,
             &self.region,
         )
@@ -425,7 +425,7 @@ impl CloudProvider for AzureCloudProvider {
     async fn get_policy_download_url(&self, key: &str) -> Result<String, anyhow::Error> {
         match crate::run_function(
             &self.function_endpoint,
-            &crate::get_generate_presigned_url_query(key, "policies"),
+            &env_defs::generate_presigned_url_event(key, "policies"),
             &self.project_id,
             &self.region,
         )
@@ -449,7 +449,7 @@ impl CloudProvider for AzureCloudProvider {
     async fn get_environment_variables(&self) -> Result<serde_json::Value, anyhow::Error> {
         match crate::run_function(
             &self.function_endpoint,
-            &crate::get_environment_variables_query(),
+            &env_defs::get_environment_variables_event(),
             &self.project_id,
             &self.region,
         )

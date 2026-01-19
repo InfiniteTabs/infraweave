@@ -208,13 +208,7 @@ pub async fn read_db(
     project_id: &str,
     region: &str,
 ) -> Result<GenericFunctionResponse, CloudHandlerError> {
-    let full_query = json!({
-        "event": "read_db",
-        "table": table,
-        "data": {
-            "query": query
-        }
-    });
+    let full_query = env_defs::read_db_event(table, query);
     run_function(function_endpoint, &full_query, project_id, region).await
 }
 
@@ -384,32 +378,6 @@ pub fn get_provider_version_query(provider: &str, version: &str) -> Value {
 
 pub fn get_stack_version_query(module: &str, track: &str, version: &str) -> Value {
     get_module_version_query(module, track, version)
-}
-
-pub fn get_generate_presigned_url_query(key: &str, bucket: &str) -> Value {
-    json!({
-        "event": "generate_presigned_url",
-            "data":{
-            "key": key,
-            "bucket_name": bucket,
-            "expires_in": 60,
-        }
-    })
-}
-
-pub fn get_job_status_query(job_id: &str) -> Value {
-    json!({
-        "event": "get_job_status",
-        "data": {
-            "job_id": job_id
-        }
-    })
-}
-
-pub fn get_environment_variables_query() -> Value {
-    json!({
-        "event": "get_environment_variables"
-    })
 }
 
 pub fn get_all_deployments_query(

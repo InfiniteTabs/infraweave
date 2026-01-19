@@ -798,11 +798,8 @@ pub async fn deprecate_stack(
         }
     }));
 
-    // Execute the Transaction
-    let payload = serde_json::json!({
-        "event": "transact_write",
-        "items": transaction_items,
-    });
+    let items = serde_json::to_value(&transaction_items)?;
+    let payload = env_defs::transact_write_event(&items);
 
     // Get all regions to update deprecation status across all of them
     let all_regions = handler.get_all_regions().await?;

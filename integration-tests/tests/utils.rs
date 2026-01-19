@@ -420,16 +420,7 @@ pub async fn upload_file(
         .map_err(|e| anyhow::anyhow!("Failed to read file {}: {}", file_path, e))?;
     let zip_base64 = base64.encode(file_content);
 
-    let payload = serde_json::json!({
-        "event": "upload_file_base64",
-        "data":
-        {
-            "key": &key,
-            "bucket_name": "modules",
-            "base64_content": &zip_base64
-        }
-
-    });
+    let payload = env_defs::upload_file_base64_event(key, "modules", &zip_base64);
     match handler.run_function(&payload).await {
         Ok(_) => {
             println!("Successfully uploaded module zip file to S3");
