@@ -169,22 +169,24 @@ async fn unified_handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let content_disposition = parts
+    let content_encoding = parts
         .headers
-        .get("content-disposition")
+        .get("content-encoding")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
     let is_binary = (content_type.starts_with("application/")
         && !content_type.starts_with("application/json"))
-        || content_type.starts_with("binary/");
+        || content_type.starts_with("binary/")
+        || !content_encoding.is_empty();
 
     let (response_body, is_base64_encoded) = if is_binary {
         let b64 = general_purpose::STANDARD.encode(&body_bytes);
         info!(
-            "Binary response detected (Content-Type: {}, Content-Disposition: {}). Base64 encoded length: {}",
+            "Binary/Compressed response (Content-Type: {}, Encoding: {}). Raw size: {} bytes. Base64 size: {}",
             content_type,
-            content_disposition,
+            content_encoding,
+            body_bytes.len(),
             b64.len()
         );
         (b64, true)

@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::compression::CompressionLayer;
 
 use crate::handlers;
 
@@ -174,6 +175,7 @@ pub fn create_router() -> Router {
         .merge(protected_routes)
         // Add CORS layer
         .layer(cors)
+        .layer(CompressionLayer::new())
 }
 
 async fn ensure_access(
