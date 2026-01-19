@@ -248,20 +248,20 @@ fn _get_latest_provider_version_query(pk: &str, provider: &str) -> Value {
     })
 }
 
-pub fn get_all_latest_modules_query(track: &str) -> Value {
-    _get_all_latest_modules_query("LATEST_MODULE", track)
+pub fn get_all_latest_modules_query(track: &str, show_deprecated: bool) -> Value {
+    _get_all_latest_modules_query("LATEST_MODULE", track, show_deprecated)
 }
 
-pub fn get_all_latest_stacks_query(track: &str) -> Value {
-    _get_all_latest_modules_query("LATEST_STACK", track)
+pub fn get_all_latest_stacks_query(track: &str, show_deprecated: bool) -> Value {
+    _get_all_latest_modules_query("LATEST_STACK", track, show_deprecated)
 }
 
 pub fn get_all_latest_providers_query() -> Value {
     _get_all_latest_providers_query("LATEST_PROVIDER")
 }
 
-fn _get_all_latest_modules_query(pk: &str, track: &str) -> Value {
-    if track.is_empty() {
+fn _get_all_latest_modules_query(pk: &str, track: &str, show_deprecated: bool) -> Value {
+    let mut query = if track.is_empty() {
         json!({
             "KeyConditionExpression": "PK = :latest",
             "ExpressionAttributeValues": {":latest": pk},
@@ -271,7 +271,24 @@ fn _get_all_latest_modules_query(pk: &str, track: &str) -> Value {
             "KeyConditionExpression": "PK = :latest and begins_with(SK, :track)",
             "ExpressionAttributeValues": {":latest": pk, ":track": format!("MODULE#{}::", track)},
         })
+    };
+
+    if !show_deprecated {
+        if let Some(obj) = query.as_object_mut() {
+            obj.insert(
+                "FilterExpression".to_string(),
+                json!("attribute_not_exists(deprecated) OR deprecated = :false"),
+            );
+            if let Some(vals) = obj
+                .get_mut("ExpressionAttributeValues")
+                .and_then(|v| v.as_object_mut())
+            {
+                vals.insert(":false".to_string(), json!(false));
+            }
+        }
     }
+
+    query
 }
 
 fn _get_all_latest_providers_query(pk: &str) -> Value {
@@ -304,6 +321,16 @@ pub fn get_module_version_query(module: &str, track: &str, version: &str) -> Val
     json!({
         "KeyConditionExpression": "PK = :module AND SK = :sk",
         "ExpressionAttributeValues": {":module": id, ":sk": version_id},
+        "Limit": 1,
+    })
+}
+
+pub fn get_provider_version_query(provider: &str, version: &str) -> Value {
+    let id: String = format!("PROVIDER#{}", provider);
+    let version_id = format!("VERSION#{}", zero_pad_semver(version, 3).unwrap());
+    json!({
+        "KeyConditionExpression": "PK = :provider AND SK = :sk",
+        "ExpressionAttributeValues": {":provider": id, ":sk": version_id},
         "Limit": 1,
     })
 }

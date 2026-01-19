@@ -1,6 +1,8 @@
+use anyhow::Result;
 use env_common::interface::GenericCloudHandler;
 use env_defs::CloudProvider;
 use inquire::Select;
+use serde_json::Value;
 use std::collections::HashSet;
 
 pub fn get_environment(environment_arg: &str) -> String {
@@ -180,4 +182,34 @@ pub async fn resolve_deployment_id(deployment_id: Option<String>, environment: &
             }
         },
     }
+}
+/// Makes an authenticated HTTP call to the internal API
+///
+/// This function uses cloud-provider-specific authentication:
+/// - AWS: SigV4 signing for API Gateway
+/// - Azure: Azure AD token authentication
+///
+/// # Arguments
+/// * `method` - HTTP method (GET, POST, PUT, DELETE)
+/// * `path` - API endpoint path (e.g., "/api/v1/module/dev/my-module/1.0.0/deprecate")
+/// * `body` - Optional JSON body for the request
+///
+/// # Environment Variables
+/// * `INFRAWEAVE_INTERNAL_API_URL` - Base URL for the internal API (required)
+/// * `AWS_REGION` - AWS region (used for SigV4 signing, auto-detected by AWS SDK)
+/// * `CLOUD_PROVIDER` - Cloud provider (aws, azure, none)
+pub async fn call_http(method: &str, path: &str, body: Option<Value>) -> Result<Value> {
+    // Get the internal API base URL from environment variable
+    let base_url = std::env::var("INFRAWEAVE_INTERNAL_API_URL").map_err(|_| {
+        anyhow::anyhow!(
+            "INFRAWEAVE_INTERNAL_API_URL environment variable is not set. \
+            Please set it to the base URL of your internal API \
+            (e.g., https://xxxxx.execute-api.us-east-1.amazonaws.com/prod)"
+        )
+    })?;
+
+    let url = format!("{}{}", base_url, path);
+
+    // Call the authenticated HTTP function from env_common
+    env_common::http_auth::call_authenticated_http(method, &url, body).await
 }

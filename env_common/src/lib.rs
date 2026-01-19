@@ -1,4 +1,5 @@
 pub mod errors;
+pub mod http_auth;
 pub mod interface;
 pub mod logic;
 

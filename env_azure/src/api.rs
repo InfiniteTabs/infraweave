@@ -1,8 +1,8 @@
 use std::{env, process::exit};
 
 use anyhow::Result;
-use azure_core::auth::TokenCredential;
-use azure_identity::{DefaultAzureCredential, TokenCredentialOptions};
+use azure_core::credentials::TokenCredential;
+use azure_identity::DeveloperToolsCredential;
 use env_defs::{
     get_change_record_identifier, get_deployment_identifier, get_event_identifier,
     get_module_identifier, get_policy_identifier, GenericFunctionResponse,
@@ -64,14 +64,14 @@ pub async fn run_function(
     } else if env::var("AZURE_CONTAINER_INSTANCE").is_ok() {
         let credential = CustomImdsCredential::new();
         credential
-            .get_token(&[&scope])
+            .get_token(&[&scope], None)
             .await?
             .token
             .secret()
             .to_string()
     } else {
-        match DefaultAzureCredential::create(TokenCredentialOptions::default())?
-            .get_token(&[&scope])
+        match DeveloperToolsCredential::new(None)?
+            .get_token(&[&scope], None)
             .await
         {
             Ok(token) => token.token.secret().to_owned(),
@@ -267,6 +267,18 @@ fn _get_all_module_versions_query(module: &str, track: &str) -> Value {
 
 pub fn get_module_version_query(module: &str, track: &str, version: &str) -> Value {
     let id: String = format!("MODULE#{}", get_module_identifier(module, track));
+    let version_id = format!("VERSION#{}", zero_pad_semver(version, 3).unwrap());
+    json!({
+        "query": "SELECT TOP 1 * FROM c WHERE c.PK = @id AND c.SK = @version_id",
+        "parameters": [
+            { "name": "@id", "value": id },
+            { "name": "@version_id", "value": version_id }
+        ]
+    })
+}
+
+pub fn get_provider_version_query(provider: &str, version: &str) -> Value {
+    let id: String = format!("PROVIDER#{}", provider);
     let version_id = format!("VERSION#{}", zero_pad_semver(version, 3).unwrap());
     json!({
         "query": "SELECT TOP 1 * FROM c WHERE c.PK = @id AND c.SK = @version_id",
