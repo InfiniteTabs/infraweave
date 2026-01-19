@@ -188,6 +188,7 @@ pub async fn resolve_deployment_id(deployment_id: Option<String>, environment: &
 /// This function uses cloud-provider-specific authentication:
 /// - AWS: SigV4 signing for API Gateway
 /// - Azure: Azure AD token authentication
+/// - Local feature: Direct calls to local DynamoDB
 ///
 /// # Arguments
 /// * `method` - HTTP method (GET, POST, PUT, DELETE)
@@ -195,21 +196,40 @@ pub async fn resolve_deployment_id(deployment_id: Option<String>, environment: &
 /// * `body` - Optional JSON body for the request
 ///
 /// # Environment Variables
-/// * `INFRAWEAVE_INTERNAL_API_URL` - Base URL for the internal API (required)
+/// * `INFRAWEAVE_INTERNAL_API_URL` - Base URL for the internal API (required when not using local feature)
+///   - For local development with local feature: http://127.0.0.1:8080
+///   - For AWS API Gateway: https://xxxxx.execute-api.us-east-1.amazonaws.com/prod
 /// * `AWS_REGION` - AWS region (used for SigV4 signing, auto-detected by AWS SDK)
 /// * `CLOUD_PROVIDER` - Cloud provider (aws, azure, none)
+///
+/// # Features
+/// * Compile with `--features local` to enable direct DynamoDB calls without HTTP API
+///   Example: `cargo run --features local -- module publish`
 pub async fn call_http(method: &str, path: &str, body: Option<Value>) -> Result<Value> {
     // Get the internal API base URL from environment variable
     let base_url = std::env::var("INFRAWEAVE_INTERNAL_API_URL").map_err(|_| {
-        anyhow::anyhow!(
-            "INFRAWEAVE_INTERNAL_API_URL environment variable is not set. \
-            Please set it to the base URL of your internal API \
-            (e.g., https://xxxxx.execute-api.us-east-1.amazonaws.com/prod)"
-        )
+        #[cfg(feature = "local")]
+        {
+            anyhow::anyhow!(
+                "INFRAWEAVE_INTERNAL_API_URL environment variable is not set. \
+                For local development, set it to: http://127.0.0.1:8080"
+            )
+        }
+        #[cfg(not(feature = "local"))]
+        {
+            anyhow::anyhow!(
+                "INFRAWEAVE_INTERNAL_API_URL environment variable is not set. \
+                Please set it to the base URL of your internal API \
+                (e.g., https://xxxxx.execute-api.us-east-1.amazonaws.com/prod)"
+            )
+        }
     })?;
 
     let url = format!("{}{}", base_url, path);
 
-    // Call the authenticated HTTP function from env_common
+    // With http feature, call_authenticated_http will use the CLOUD_PROVIDER env var:
+    // - Set CLOUD_PROVIDER=none for local unauthenticated API
+    // - Set CLOUD_PROVIDER=aws for API Gateway with SigV4 signing
+    // - Set CLOUD_PROVIDER=azure for Azure with AD token auth
     env_common::http_auth::call_authenticated_http(method, &url, body).await
 }

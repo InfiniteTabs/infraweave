@@ -248,19 +248,19 @@ fn _get_latest_provider_version_query(pk: &str, provider: &str) -> Value {
     })
 }
 
-pub fn get_all_latest_modules_query(track: &str, show_deprecated: bool) -> Value {
-    _get_all_latest_modules_query("LATEST_MODULE", track, show_deprecated)
+pub fn get_all_latest_modules_query(track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+    _get_all_latest_modules_query("LATEST_MODULE", track, include_deprecated, include_dev000)
 }
 
-pub fn get_all_latest_stacks_query(track: &str, show_deprecated: bool) -> Value {
-    _get_all_latest_modules_query("LATEST_STACK", track, show_deprecated)
+pub fn get_all_latest_stacks_query(track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+    _get_all_latest_modules_query("LATEST_STACK", track, include_deprecated, include_dev000)
 }
 
 pub fn get_all_latest_providers_query() -> Value {
     _get_all_latest_providers_query("LATEST_PROVIDER")
 }
 
-fn _get_all_latest_modules_query(pk: &str, track: &str, show_deprecated: bool) -> Value {
+fn _get_all_latest_modules_query(pk: &str, track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
     let mut query = if track.is_empty() {
         json!({
             "KeyConditionExpression": "PK = :latest",
@@ -273,17 +273,32 @@ fn _get_all_latest_modules_query(pk: &str, track: &str, show_deprecated: bool) -
         })
     };
 
-    if !show_deprecated {
-        if let Some(obj) = query.as_object_mut() {
-            obj.insert(
-                "FilterExpression".to_string(),
-                json!("attribute_not_exists(deprecated) OR deprecated = :false"),
-            );
+    let mut filters = Vec::new();
+
+    if !include_deprecated {
+        filters.push("attribute_not_exists(deprecated) OR deprecated = :false");
+    }
+
+    if !include_dev000 {
+        filters.push("NOT begins_with(version, :dev_prefix)");
+    }
+
+    if !filters.is_empty() {
+         if let Some(obj) = query.as_object_mut() {
+            // Better join logic:
+            let filter_expression = filters.iter().map(|f| format!("({})", f)).collect::<Vec<_>>().join(" AND ");
+            obj.insert("FilterExpression".to_string(), json!(filter_expression));
+
             if let Some(vals) = obj
                 .get_mut("ExpressionAttributeValues")
                 .and_then(|v| v.as_object_mut())
             {
-                vals.insert(":false".to_string(), json!(false));
+                 if !include_deprecated {
+                    vals.insert(":false".to_string(), json!(false));
+                 }
+                 if !include_dev000 {
+                    vals.insert(":dev_prefix".to_string(), json!("0.0.0-dev"));
+                 }
             }
         }
     }
@@ -298,21 +313,53 @@ fn _get_all_latest_providers_query(pk: &str) -> Value {
     })
 }
 
-pub fn get_all_module_versions_query(module: &str, track: &str) -> Value {
-    _get_all_module_versions_query(module, track)
+pub fn get_all_module_versions_query(module: &str, track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+    _get_all_module_versions_query(module, track, include_deprecated, include_dev000)
 }
 
-pub fn get_all_stack_versions_query(stack: &str, track: &str) -> Value {
-    _get_all_module_versions_query(stack, track)
+pub fn get_all_stack_versions_query(stack: &str, track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+    _get_all_module_versions_query(stack, track, include_deprecated, include_dev000)
 }
 
-fn _get_all_module_versions_query(module: &str, track: &str) -> Value {
+fn _get_all_module_versions_query(module: &str, track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+    log::info!("_get_all_module_versions_query: module={}, track={}, include_deprecated={}, include_dev000={}", module, track, include_deprecated, include_dev000);
     let id: String = format!("MODULE#{}", get_module_identifier(module, track));
-    json!({
+    let mut query = json!({
         "KeyConditionExpression": "PK = :module AND begins_with(SK, :sk)",
         "ExpressionAttributeValues": {":module": id, ":sk": "VERSION#"},
         "ScanIndexForward": false,
-    })
+    });
+
+    let mut filters = Vec::new();
+
+    if !include_deprecated {
+        filters.push("attribute_not_exists(deprecated) OR deprecated = :false");
+    }
+
+    if !include_dev000 {
+        filters.push("NOT begins_with(version, :dev_prefix)");
+    }
+
+    if !filters.is_empty() {
+         if let Some(obj) = query.as_object_mut() {
+            let filter_expression = filters.iter().map(|f| format!("({})", f)).collect::<Vec<_>>().join(" AND ");
+            obj.insert("FilterExpression".to_string(), json!(filter_expression));
+
+            if let Some(vals) = obj
+                .get_mut("ExpressionAttributeValues")
+                .and_then(|v| v.as_object_mut())
+            {
+                 if !include_deprecated {
+                    vals.insert(":false".to_string(), json!(false));
+                 }
+                 if !include_dev000 {
+                    vals.insert(":dev_prefix".to_string(), json!("0.0.0-dev"));
+                 }
+            }
+        }
+    }
+
+    query
 }
 
 pub fn get_module_version_query(module: &str, track: &str, version: &str) -> Value {

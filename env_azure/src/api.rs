@@ -136,13 +136,7 @@ pub async fn read_db(
     project_id: &str,
     region: &str,
 ) -> Result<GenericFunctionResponse, anyhow::Error> {
-    let full_query = json!({
-        "event": "read_db",
-        "table": table,
-        "data": {
-            "query": query
-        }
-    });
+    let full_query = env_defs::read_db_event(table, query);
     run_function(function_endpoint, &full_query, project_id, region).await
 }
 
@@ -180,61 +174,39 @@ fn _get_latest_provider_version_query(pk: &str, provider: &str) -> Value {
     })
 }
 
-pub fn get_generate_presigned_url_query(key: &str, bucket: &str) -> Value {
-    json!({
-        "event": "generate_presigned_url",
-            "data":{
-            "key": key,
-            "bucket_name": bucket,
-            "expires_in": 60,
-        }
-    })
+pub fn get_all_latest_modules_query(track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+    _get_all_latest_modules_query("LATEST_MODULE", track, include_deprecated, include_dev000)
 }
 
-pub fn get_job_status_query(job_id: &str) -> Value {
-    json!({
-        "event": "get_job_status",
-        "data": {
-            "job_id": job_id
-        }
-    })
-}
-
-pub fn get_environment_variables_query() -> Value {
-    json!({
-        "event": "get_environment_variables"
-    })
-}
-
-pub fn get_all_latest_modules_query(track: &str) -> Value {
-    _get_all_latest_modules_query("LATEST_MODULE", track)
-}
-
-pub fn get_all_latest_stacks_query(track: &str) -> Value {
-    _get_all_latest_modules_query("LATEST_STACK", track)
+pub fn get_all_latest_stacks_query(track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+    _get_all_latest_modules_query("LATEST_STACK", track, include_deprecated, include_dev000)
 }
 
 pub fn get_all_latest_providers_query() -> Value {
     _get_all_latest_providers_query("LATEST_PROVIDER")
 }
 
-fn _get_all_latest_modules_query(pk: &str, track: &str) -> Value {
-    if track.is_empty() {
-        json!({
-            "query": "SELECT * FROM c WHERE c.PK = @pk",
-            "parameters": [
-                { "name": "@pk", "value": pk }
-            ]
-        })
-    } else {
-        json!({
-            "query": "SELECT * FROM c WHERE c.PK = @pk AND STARTSWITH(c.SK, @prefix)",
-            "parameters": [
-                { "name": "@pk", "value": pk },
-                { "name": "@prefix", "value": format!("MODULE#{}::", track) }
-            ]
-        })
+fn _get_all_latest_modules_query(pk: &str, track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+    let mut query_str = String::from("SELECT * FROM c WHERE c.PK = @pk");
+    let mut parameters = vec![json!({ "name": "@pk", "value": pk })];
+
+    if !track.is_empty() {
+        query_str.push_str(" AND STARTSWITH(c.SK, @prefix)");
+        parameters.push(json!({ "name": "@prefix", "value": format!("MODULE#{}::", track) }));
     }
+
+    if !include_deprecated {
+        query_str.push_str(" AND (NOT IS_DEFINED(c.deprecated) OR c.deprecated = false)");
+    }
+
+    if !include_dev000 {
+        query_str.push_str(" AND (NOT STARTSWITH(c.version, '0.0.0-dev'))");
+    }
+
+    json!({
+        "query": query_str,
+        "parameters": parameters
+    })
 }
 
 fn _get_all_latest_providers_query(pk: &str) -> Value {
@@ -246,22 +218,33 @@ fn _get_all_latest_providers_query(pk: &str) -> Value {
     })
 }
 
-pub fn get_all_module_versions_query(module: &str, track: &str) -> Value {
-    _get_all_module_versions_query(module, track)
+pub fn get_all_module_versions_query(module: &str, track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+    _get_all_module_versions_query(module, track, include_deprecated, include_dev000)
 }
 
-pub fn get_all_stack_versions_query(stack: &str, track: &str) -> Value {
-    _get_all_module_versions_query(stack, track)
+pub fn get_all_stack_versions_query(stack: &str, track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+    _get_all_module_versions_query(stack, track, include_deprecated, include_dev000)
 }
 
-fn _get_all_module_versions_query(module: &str, track: &str) -> Value {
+fn _get_all_module_versions_query(module: &str, track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
     let id: String = format!("MODULE#{}", get_module_identifier(module, track));
+    let mut query_str = String::from("SELECT * FROM c WHERE c.PK = @id AND STARTSWITH(c.SK, @prefix)");
+    let parameters = vec![
+        json!({ "name": "@id", "value": id }),
+        json!({ "name": "@prefix", "value": "VERSION#" }),
+    ];
+
+    if !include_deprecated {
+        query_str.push_str(" AND (NOT IS_DEFINED(c.deprecated) OR c.deprecated = false)");
+    }
+
+    if !include_dev000 {
+        query_str.push_str(" AND (NOT STARTSWITH(c.version, '0.0.0-dev'))");
+    }
+
     json!({
-        "query": "SELECT * FROM c WHERE c.PK = @id AND STARTSWITH(c.SK, @prefix)",
-        "parameters": [
-            { "name": "@id", "value": id },
-            { "name": "@prefix", "value": "VERSION#" }
-        ]
+        "query": query_str,
+        "parameters": parameters,
     })
 }
 
