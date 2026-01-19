@@ -567,11 +567,48 @@ pub fn get_events_query(
     region: &str,
     deployment_id: &str,
     environment: &str,
+    event_type: Option<&str>,
 ) -> Value {
-    json!({
+    let mut query = json!({
         "KeyConditionExpression": "PK = :pk",
-        "ExpressionAttributeValues": {":pk": format!("EVENT#{}", get_event_identifier(project_id, region, deployment_id, environment))}
-    })
+        "ExpressionAttributeValues": {":pk": format!("EVENT#{}", get_event_identifier(project_id, region, deployment_id, environment))},
+        "ScanIndexForward": false
+    });
+
+    if let Some(etype) = event_type {
+        if etype == "mutate" {
+            query["FilterExpression"] = json!("#event = :apply OR #event = :destroy");
+            query["ExpressionAttributeNames"] = json!({"#event": "event"});
+            if let Some(values) = query
+                .get_mut("ExpressionAttributeValues")
+                .and_then(|v| v.as_object_mut())
+            {
+                values.insert(":apply".to_string(), json!("apply"));
+                values.insert(":destroy".to_string(), json!("destroy"));
+            }
+        } else if etype == "plan" {
+            query["FilterExpression"] = json!("#event = :plan");
+            query["ExpressionAttributeNames"] = json!({"#event": "event"});
+            if let Some(values) = query
+                .get_mut("ExpressionAttributeValues")
+                .and_then(|v| v.as_object_mut())
+            {
+                values.insert(":plan".to_string(), json!("plan"));
+            }
+        } else if !etype.is_empty() {
+            query["FilterExpression"] = json!("#event = :event");
+            query["ExpressionAttributeNames"] = json!({"#event": "event"});
+
+            if let Some(values) = query
+                .get_mut("ExpressionAttributeValues")
+                .and_then(|v| v.as_object_mut())
+            {
+                values.insert(":event".to_string(), json!(etype));
+            }
+        }
+    }
+
+    query
 }
 
 pub fn get_all_events_between_query(region: &str, start_epoch: u128, end_epoch: u128) -> Value {

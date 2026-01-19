@@ -561,12 +561,29 @@ pub fn get_events_query(
     region: &str,
     deployment_id: &str,
     environment: &str,
+    event_type: Option<&str>,
 ) -> Value {
+    let mut query_str = "SELECT * FROM c WHERE c.PK = @pk".to_string();
+    let mut params = vec![
+        json!({ "name": "@pk", "value": format!("EVENT#{}", get_event_identifier(project_id, region, deployment_id, environment))}),
+    ];
+
+    if let Some(etype) = event_type {
+        if etype == "mutate" {
+            query_str.push_str(" AND (c.event = 'apply' OR c.event = 'destroy')");
+        } else if etype == "plan" {
+            query_str.push_str(" AND c.event = 'plan'");
+        } else if !etype.is_empty() {
+            query_str.push_str(" AND c.event = @event");
+            params.push(json!({ "name": "@event", "value": etype }));
+        }
+    }
+
+    query_str.push_str(" ORDER BY c.SK DESC");
+
     json!({
-        "query": "SELECT * FROM c WHERE c.PK = @pk",
-        "parameters": [
-            { "name": "@pk", "value": format!("EVENT#{}", get_event_identifier(project_id, region, deployment_id, environment))}
-        ]
+        "query": query_str,
+        "parameters": params
     })
 }
 

@@ -365,7 +365,13 @@ impl CloudProvider for AzureCloudProvider {
     ) -> Result<Vec<EventData>, anyhow::Error> {
         _get_events(
             self,
-            crate::get_events_query(&self.project_id, &self.region, deployment_id, environment),
+            crate::get_events_query(
+                &self.project_id,
+                &self.region,
+                deployment_id,
+                environment,
+                None,
+            ),
         )
         .await
     }
