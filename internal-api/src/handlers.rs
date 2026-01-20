@@ -1,17 +1,21 @@
 use crate::api_common::{self, DatabaseQuery};
-use crate::queries::*;
 use crate::get_param;
-use crate::common::get_env_var; // Assuming common is accessible
-use serde_json::{json, Value};
+use crate::queries::*;
 use anyhow::{anyhow, Result};
 use axum::response::{IntoResponse, Response};
 use log::info;
+use serde_json::{json, Value};
 
 #[cfg(feature = "aws")]
-use crate::aws_handlers::{AwsDatabase as Database, get_user_allowed_projects, download_file, download_file_as_string, get_bucket_name};
+use crate::aws_handlers::{
+    download_file, download_file_as_string, get_bucket_name, get_user_allowed_projects,
+    AwsDatabase as Database,
+};
 
 #[cfg(feature = "azure")]
-use crate::azure_handlers::{AzureDatabase as Database, get_user_allowed_projects, download_file, download_file_as_string};
+use crate::azure_handlers::{
+    download_file, download_file_as_string, get_user_allowed_projects, AzureDatabase as Database,
+};
 
 pub async fn describe_deployment(payload: &Value) -> Result<Value> {
     api_common::describe_deployment_impl(&Database, payload, get_deployment_and_dependents_query)
@@ -200,15 +204,15 @@ pub async fn get_change_record_graph(payload: &Value) -> Result<Response> {
     info!("Graph content length: {}", graph_content.len());
     info!("Graph content preview: {:.500}", graph_content);
 
-    let graph = json!({}); // Placeholder until tofu is imported
-    // let graph = tofu::process_graph(&plan_content, &graph_content, true, None)
-    //     .map_err(|e| anyhow!("Failed to process graph: {}", e))?;
+    // let graph = json!({}); // Placeholder until tofu is imported
+    let graph = tofu::process_graph(&plan_content, &graph_content, true, None)
+        .map_err(|e| anyhow!("Failed to process graph: {}", e))?;
 
-    // info!(
-    //     "Processed graph nodes: {}, edges: {}",
-    //     graph.nodes.len(),
-    //     graph.edges.len()
-    // );
+    info!(
+        "Processed graph nodes: {}, edges: {}",
+        graph.nodes.len(),
+        graph.edges.len()
+    );
 
     Ok((axum::http::StatusCode::OK, axum::Json(graph)).into_response())
 }
@@ -272,15 +276,15 @@ pub async fn get_deployment_graph(payload: &Value) -> Result<Response> {
     );
     let graph_content = download_file_as_string(&container_name, &graph_key).await?;
 
-    let graph = json!({}); // Placeholder until tofu is imported
-    // let graph = tofu::process_graph(&state_content, &graph_content, true, None)
-    //     .map_err(|e| anyhow!("Failed to process graph: {}", e))?;
+    // let graph = json!({}); // Placeholder until tofu is imported
+    let graph = tofu::process_graph(&state_content, &graph_content, true, None)
+        .map_err(|e| anyhow!("Failed to process graph: {}", e))?;
 
-    // info!(
-    //     "Processed graph nodes: {}, edges: {}",
-    //     graph.nodes.len(),
-    //     graph.edges.len()
-    // );
+    info!(
+        "Processed graph nodes: {}, edges: {}",
+        graph.nodes.len(),
+        graph.edges.len()
+    );
 
     Ok((axum::http::StatusCode::OK, axum::Json(graph)).into_response())
 }

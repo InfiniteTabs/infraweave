@@ -60,7 +60,7 @@ chrono = { version = "0.4", optional = true }
 time = { version = "0.3", optional = true }
 hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
-# tofu = { version = "0.1.0", path = "../tofu" }
+tofu = { path = "../tofu" }
 
 [lib]
 name = "internal_api"
