@@ -2,10 +2,10 @@ use env_common::{
     errors::ModuleError,
     logic::{deprecate_module, precheck_module, publish_module},
 };
+use env_defs::CloudProvider;
 use log::{error, info};
 
 use crate::current_region_handler;
-use env_defs::CloudProvider;
 
 pub async fn handle_publish(
     path: &str,
@@ -20,7 +20,7 @@ pub async fn handle_publish(
         Err(ModuleError::ModuleVersionExists(version, error)) => {
             if no_fail_on_exist {
                 info!(
-                    "Module version {} already exists: {}, but continuing due to --no-fail-on-exist exits with success",
+                    "Module version {} already exists: {}, but continuing due to --no-fail-on-exist",
                     version, error
                 );
             } else {

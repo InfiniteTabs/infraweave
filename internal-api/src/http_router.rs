@@ -9,8 +9,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use tower_http::cors::{Any, CorsLayer};
 use tower_http::compression::CompressionLayer;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::handlers;
 

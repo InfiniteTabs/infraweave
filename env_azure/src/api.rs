@@ -174,11 +174,19 @@ fn _get_latest_provider_version_query(pk: &str, provider: &str) -> Value {
     })
 }
 
-pub fn get_all_latest_modules_query(track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+pub fn get_all_latest_modules_query(
+    track: &str,
+    include_deprecated: bool,
+    include_dev000: bool,
+) -> Value {
     _get_all_latest_modules_query("LATEST_MODULE", track, include_deprecated, include_dev000)
 }
 
-pub fn get_all_latest_stacks_query(track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+pub fn get_all_latest_stacks_query(
+    track: &str,
+    include_deprecated: bool,
+    include_dev000: bool,
+) -> Value {
     _get_all_latest_modules_query("LATEST_STACK", track, include_deprecated, include_dev000)
 }
 
@@ -186,7 +194,12 @@ pub fn get_all_latest_providers_query() -> Value {
     _get_all_latest_providers_query("LATEST_PROVIDER")
 }
 
-fn _get_all_latest_modules_query(pk: &str, track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+fn _get_all_latest_modules_query(
+    pk: &str,
+    track: &str,
+    include_deprecated: bool,
+    include_dev000: bool,
+) -> Value {
     let mut query_str = String::from("SELECT * FROM c WHERE c.PK = @pk");
     let mut parameters = vec![json!({ "name": "@pk", "value": pk })];
 
@@ -218,17 +231,33 @@ fn _get_all_latest_providers_query(pk: &str) -> Value {
     })
 }
 
-pub fn get_all_module_versions_query(module: &str, track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+pub fn get_all_module_versions_query(
+    module: &str,
+    track: &str,
+    include_deprecated: bool,
+    include_dev000: bool,
+) -> Value {
     _get_all_module_versions_query(module, track, include_deprecated, include_dev000)
 }
 
-pub fn get_all_stack_versions_query(stack: &str, track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+pub fn get_all_stack_versions_query(
+    stack: &str,
+    track: &str,
+    include_deprecated: bool,
+    include_dev000: bool,
+) -> Value {
     _get_all_module_versions_query(stack, track, include_deprecated, include_dev000)
 }
 
-fn _get_all_module_versions_query(module: &str, track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+fn _get_all_module_versions_query(
+    module: &str,
+    track: &str,
+    include_deprecated: bool,
+    include_dev000: bool,
+) -> Value {
     let id: String = format!("MODULE#{}", get_module_identifier(module, track));
-    let mut query_str = String::from("SELECT * FROM c WHERE c.PK = @id AND STARTSWITH(c.SK, @prefix)");
+    let mut query_str =
+        String::from("SELECT * FROM c WHERE c.PK = @id AND STARTSWITH(c.SK, @prefix)");
     let parameters = vec![
         json!({ "name": "@id", "value": id }),
         json!({ "name": "@prefix", "value": "VERSION#" }),

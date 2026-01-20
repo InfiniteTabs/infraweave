@@ -222,10 +222,18 @@ impl CloudProvider for AwsCloudProvider {
         Ok(())
     }
     async fn get_all_latest_module(&self, track: &str) -> Result<Vec<ModuleResp>, anyhow::Error> {
-        _get_modules(self, crate::get_all_latest_modules_query(track, false, false)).await
+        _get_modules(
+            self,
+            crate::get_all_latest_modules_query(track, false, false),
+        )
+        .await
     }
     async fn get_all_latest_stack(&self, track: &str) -> Result<Vec<ModuleResp>, anyhow::Error> {
-        _get_modules(self, crate::get_all_latest_stacks_query(track, false, false)).await
+        _get_modules(
+            self,
+            crate::get_all_latest_stacks_query(track, false, false),
+        )
+        .await
     }
     async fn get_all_latest_provider(&self) -> Result<Vec<ProviderResp>, anyhow::Error> {
         _get_providers(self, crate::get_all_latest_providers_query()).await
@@ -235,14 +243,22 @@ impl CloudProvider for AwsCloudProvider {
         module: &str,
         track: &str,
     ) -> Result<Vec<ModuleResp>, anyhow::Error> {
-        _get_modules(self, crate::get_all_module_versions_query(module, track, false, false)).await
+        _get_modules(
+            self,
+            crate::get_all_module_versions_query(module, track, false, false),
+        )
+        .await
     }
     async fn get_all_stack_versions(
         &self,
         stack: &str,
         track: &str,
     ) -> Result<Vec<ModuleResp>, anyhow::Error> {
-        _get_modules(self, crate::get_all_stack_versions_query(stack, track, false, false)).await
+        _get_modules(
+            self,
+            crate::get_all_stack_versions_query(stack, track, false, false),
+        )
+        .await
     }
     async fn get_module_version(
         &self,

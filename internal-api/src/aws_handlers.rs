@@ -3,19 +3,15 @@ use anyhow::{anyhow, Result};
 #[cfg(feature = "aws")]
 use aws_sdk_dynamodb::operation::RequestId;
 #[cfg(feature = "aws")]
-use axum::{
-    body::Body,
-    http::header,
-    response::Response,
-};
+use axum::{body::Body, http::header, response::Response};
 #[cfg(feature = "aws")]
 use base64::{engine::general_purpose, Engine as _};
 #[cfg(feature = "aws")]
 use log::info;
 #[cfg(feature = "aws")]
-use serde_json::{json, Value};
+use serde_dynamo::{from_item, to_attribute_value, to_item};
 #[cfg(feature = "aws")]
-use serde_dynamo::{to_attribute_value, from_item, to_item};
+use serde_json::{json, Value};
 #[cfg(feature = "aws")]
 use std::collections::HashMap;
 #[cfg(feature = "aws")]
@@ -25,7 +21,7 @@ use tokio_util::io::ReaderStream;
 use crate::common::get_env_var;
 
 #[cfg(feature = "aws")]
-use crate::api_common::{DatabaseQuery};
+use crate::api_common::DatabaseQuery;
 #[cfg(feature = "aws")]
 use crate::get_param;
 
@@ -804,8 +800,6 @@ fn json_to_dynamodb_item(
 ) -> Result<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> {
     to_item(json).map_err(|e| anyhow!("{}", e))
 }
-
-
 
 // API routes from webserver-openapi - MOVED TO handlers.rs
 

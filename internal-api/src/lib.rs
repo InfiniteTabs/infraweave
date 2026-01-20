@@ -1,5 +1,4 @@
 mod api_common;
-mod queries;
 #[cfg(feature = "aws")]
 pub mod aws_handlers;
 #[cfg(feature = "azure")]

@@ -242,11 +242,19 @@ fn _get_latest_provider_version_query(pk: &str, provider: &str) -> Value {
     })
 }
 
-pub fn get_all_latest_modules_query(track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+pub fn get_all_latest_modules_query(
+    track: &str,
+    include_deprecated: bool,
+    include_dev000: bool,
+) -> Value {
     _get_all_latest_modules_query("LATEST_MODULE", track, include_deprecated, include_dev000)
 }
 
-pub fn get_all_latest_stacks_query(track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+pub fn get_all_latest_stacks_query(
+    track: &str,
+    include_deprecated: bool,
+    include_dev000: bool,
+) -> Value {
     _get_all_latest_modules_query("LATEST_STACK", track, include_deprecated, include_dev000)
 }
 
@@ -254,7 +262,12 @@ pub fn get_all_latest_providers_query() -> Value {
     _get_all_latest_providers_query("LATEST_PROVIDER")
 }
 
-fn _get_all_latest_modules_query(pk: &str, track: &str, include_deprecated: bool, include_dev000: bool) -> Value {
+fn _get_all_latest_modules_query(
+    pk: &str,
+    track: &str,
+    include_deprecated: bool,
+    include_dev000: bool,
+) -> Value {
     let mut query = if track.is_empty() {
         json!({
             "KeyConditionExpression": "PK = :latest",
@@ -278,21 +291,25 @@ fn _get_all_latest_modules_query(pk: &str, track: &str, include_deprecated: bool
     }
 
     if !filters.is_empty() {
-         if let Some(obj) = query.as_object_mut() {
+        if let Some(obj) = query.as_object_mut() {
             // Better join logic:
-            let filter_expression = filters.iter().map(|f| format!("({})", f)).collect::<Vec<_>>().join(" AND ");
+            let filter_expression = filters
+                .iter()
+                .map(|f| format!("({})", f))
+                .collect::<Vec<_>>()
+                .join(" AND ");
             obj.insert("FilterExpression".to_string(), json!(filter_expression));
 
             if let Some(vals) = obj
                 .get_mut("ExpressionAttributeValues")
                 .and_then(|v| v.as_object_mut())
             {
-                 if !include_deprecated {
+                if !include_deprecated {
                     vals.insert(":false".to_string(), json!(false));
-                 }
-                 if !include_dev000 {
+                }
+                if !include_dev000 {
                     vals.insert(":dev_prefix".to_string(), json!("0.0.0-dev"));
-                 }
+                }
             }
         }
     }
@@ -335,20 +352,24 @@ fn _get_all_module_versions_query(module: &str, track: &str, include_deprecated:
     }
 
     if !filters.is_empty() {
-         if let Some(obj) = query.as_object_mut() {
-            let filter_expression = filters.iter().map(|f| format!("({})", f)).collect::<Vec<_>>().join(" AND ");
+        if let Some(obj) = query.as_object_mut() {
+            let filter_expression = filters
+                .iter()
+                .map(|f| format!("({})", f))
+                .collect::<Vec<_>>()
+                .join(" AND ");
             obj.insert("FilterExpression".to_string(), json!(filter_expression));
 
             if let Some(vals) = obj
                 .get_mut("ExpressionAttributeValues")
                 .and_then(|v| v.as_object_mut())
             {
-                 if !include_deprecated {
+                if !include_deprecated {
                     vals.insert(":false".to_string(), json!(false));
-                 }
-                 if !include_dev000 {
+                }
+                if !include_dev000 {
                     vals.insert(":dev_prefix".to_string(), json!("0.0.0-dev"));
-                 }
+                }
             }
         }
     }

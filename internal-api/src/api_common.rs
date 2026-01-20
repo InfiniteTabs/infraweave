@@ -133,7 +133,13 @@ pub async fn get_modules_impl<Q: DatabaseQuery>(
         .get("include_dev000")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    query_all(db, "modules", qb("", include_deprecated, include_dev000), Some(payload)).await
+    query_all(
+        db,
+        "modules",
+        qb("", include_deprecated, include_dev000),
+        Some(payload),
+    )
+    .await
 }
 
 pub async fn get_projects_impl<Q: DatabaseQuery>(
@@ -157,7 +163,13 @@ pub async fn get_stacks_impl<Q: DatabaseQuery>(
         .get("include_dev000")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    query_all(db, "modules", qb("", include_deprecated, include_dev000), Some(payload)).await
+    query_all(
+        db,
+        "modules",
+        qb("", include_deprecated, include_dev000),
+        Some(payload),
+    )
+    .await
 }
 
 pub async fn get_providers_impl<Q: DatabaseQuery>(
