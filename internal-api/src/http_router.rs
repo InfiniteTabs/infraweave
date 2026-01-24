@@ -116,6 +116,10 @@ pub fn create_router() -> Router {
 
     // Open routes / Global lookups
     let open_routes = Router::new()
+        .route(
+            "/2015-03-31/functions/:function_name/invocations",
+            post(handlers::handle_lambda_invocation),
+        )
         .route("/api/v1/modules", get(get_modules))
         .route("/api/v1/projects", get(get_projects))
         .route("/api/v1/stacks", get(get_stacks))
@@ -199,15 +203,23 @@ async fn ensure_access(
             )),
         }
     } else {
-        // Decide policy: If no user header is present, do we allow?
-        // Given the requirement "only filter the ones the user has access to", strictly implying strict auth.
-        // Assuming strict auth:
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "error": "Missing authentication user context"
-            })),
-        ))
+        #[cfg(feature = "local")]
+        {
+            log::warn!(
+                "Missing x-auth-user header, allowing access to project {} (LOCAL MODE ONLY)",
+                project_id
+            );
+            Ok(())
+        }
+        #[cfg(not(feature = "local"))]
+        {
+            Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": "Missing authentication user context"
+                })),
+            ))
+        }
     }
 }
 

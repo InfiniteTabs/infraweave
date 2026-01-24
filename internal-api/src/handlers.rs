@@ -75,8 +75,7 @@ pub async fn get_module_version(payload: &Value) -> Result<Value> {
 
 pub async fn get_module_download_url(payload: &Value) -> Result<Response> {
     let module_version =
-        api_common::get_module_version_impl(&Database, payload, get_module_version_query)
-            .await?;
+        api_common::get_module_version_impl(&Database, payload, get_module_version_query).await?;
     let s3_key = module_version
         .get("s3_key")
         .and_then(|v| v.as_str())
@@ -86,7 +85,7 @@ pub async fn get_module_download_url(payload: &Value) -> Result<Response> {
     let bucket = get_bucket_name("modules")?;
     #[cfg(feature = "azure")]
     let bucket = get_env_var("MODULE_S3_BUCKET")?;
-    
+
     download_file(&bucket, s3_key).await
 }
 
@@ -132,12 +131,8 @@ pub async fn get_stack_download_url(payload: &Value) -> Result<Response> {
 }
 
 pub async fn get_all_versions_for_module(payload: &Value) -> Result<Value> {
-    api_common::get_all_versions_for_module_impl(
-        &Database,
-        payload,
-        get_all_module_versions_query,
-    )
-    .await
+    api_common::get_all_versions_for_module_impl(&Database, payload, get_all_module_versions_query)
+        .await
 }
 
 pub async fn get_all_versions_for_stack(payload: &Value) -> Result<Value> {
@@ -164,16 +159,19 @@ pub async fn get_change_record(payload: &Value) -> Result<Value> {
 
 pub async fn get_change_record_graph(payload: &Value) -> Result<Response> {
     info!("get_change_record_graph payload: {:?}", payload);
-    let change_record =
-        match api_common::get_change_record_impl(&Database, payload, get_change_records_query)
-            .await
-        {
-            Ok(cr) => cr,
-            Err(e) => {
-                log::error!("Failed to fetch change record: {:?}", e);
-                return Err(e);
-            }
-        };
+    let change_record = match api_common::get_change_record_impl(
+        &Database,
+        payload,
+        get_change_records_query,
+    )
+    .await
+    {
+        Ok(cr) => cr,
+        Err(e) => {
+            log::error!("Failed to fetch change record: {:?}", e);
+            return Err(e);
+        }
+    };
 
     let plan_key = change_record
         .get("plan_raw_json_key")
@@ -240,7 +238,9 @@ pub async fn get_deployment_graph(payload: &Value) -> Result<Response> {
         "MUTATE",
     );
 
-    let cr_resp = Database.query_container("change_records", &cr_query).await?;
+    let cr_resp = Database
+        .query_container("change_records", &cr_query)
+        .await?;
     let change_record = cr_resp
         .get("Items")
         .and_then(|v| v.as_array())
@@ -308,7 +308,6 @@ pub async fn deprecate_module(payload: &Value) -> Result<Value> {
 
 // Re-export or delegate remaining handlers if needed, assuming they are imported from handlers module
 
-
 // Specialized handlers
 #[cfg(feature = "aws")]
 pub use crate::aws_handlers::{
@@ -323,3 +322,23 @@ pub use crate::azure_handlers::{
     get_publish_job_status, insert_db, publish_module, publish_notification, read_db, read_logs,
     start_runner, transact_write, upload_file_base64, upload_file_url,
 };
+
+pub async fn handle_lambda_invocation(
+    axum::extract::Path(_function_name): axum::extract::Path<String>,
+    axum::Json(payload): axum::Json<Value>,
+) -> impl IntoResponse {
+    let project_id = env_common::logic::PROJECT_ID
+        .get()
+        .cloned()
+        .unwrap_or_default();
+    let region = env_common::logic::REGION.get().cloned().unwrap_or_default();
+
+    match env_aws::run_function(&None, &payload, &project_id, &region).await {
+        Ok(response) => (axum::http::StatusCode::OK, axum::Json(response.payload)).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}

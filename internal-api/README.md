@@ -20,15 +20,35 @@ Multi-cloud serverless API for Infraweave. Supports both direct invocation (AWS 
 ## Build
 
 ```bash
-# AWS
+# AWS Lambda
 docker build -f internal-api/Dockerfile.lambda -t internal-api-lambda .
 
-# Azure  
+# Azure Functions
 docker build -f internal-api/Dockerfile.azure -t internal-api-azure .
-
-# Local
-cargo run --bin internal-api-local --features aws
 ```
+
+## Local Development
+
+Start the local test infrastructure (DynamoDB Local + MinIO):
+
+```bash
+LOG_LEVEL=info cargo run --bin internal-api-local --features local,aws
+```
+
+This automatically:
+- Starts DynamoDB Local on port 8000
+- Starts MinIO (S3-compatible) on port 9000
+- Creates all required tables and buckets
+- Seeds sample data from `integration-tests/`
+- Starts HTTP API on http://localhost:8080
+
+Then in a separate terminal, use the CLI with local mode:
+
+```bash
+cargo run --bin cli --features local -- module list stable
+```
+
+The `local` feature enables direct DynamoDB access, bypassing the HTTP API.
 
 ## HTTP API
 

@@ -48,3 +48,6 @@ pub use http_auth::{call_authenticated_http, call_authenticated_http_with_config
 pub use job_id::get_current_job_id;
 pub use provider::AwsCloudProvider;
 pub use utils::get_region;
+
+#[cfg(feature = "direct")]
+pub use utils::{DEFAULT_BUCKET_NAMES, DEFAULT_TABLE_NAMES};

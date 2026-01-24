@@ -44,3 +44,7 @@ env_utils = { path = "../utils" }
 env_aws = { path = "../env_aws", optional = true }
 webserver-openapi = { path = "../webserver-openapi" }
 gitops = { path = "../gitops" }
+
+[features]
+default = []
+local = ["env_aws/direct"]

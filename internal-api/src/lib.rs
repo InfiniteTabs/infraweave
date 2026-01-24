@@ -7,5 +7,8 @@ pub mod azure_handlers;
 mod common;
 pub mod handlers;
 pub mod http_router;
+#[cfg(feature = "local")]
+pub mod local_setup;
+mod queries;
 
 pub use common::CloudRuntime;

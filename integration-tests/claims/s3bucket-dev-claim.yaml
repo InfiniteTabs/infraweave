@@ -1,10 +1,10 @@
 apiVersion: infraweave.io/v1
-kind: S3Bucket
+kind: S3BucketSimple
 metadata:
   name: my-s3bucket2
 spec:
   region: us-west-2
-  moduleVersion: 0.1.2-dev+test.10
+  moduleVersion: 1.0.0
   reference: https://github.com/some-repo/some-path/claim.yaml
   variables:
     bucketName: dev-my-unique-bucket-name-1234-playground

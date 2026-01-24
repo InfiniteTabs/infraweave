@@ -546,5 +546,7 @@ pub fn get_region_env_var() -> &'static str {
 }
 
 fn provider_name() -> String {
-    std::env::var("PROVIDER").unwrap_or_else(|_| "aws".into()) // TODO: don't use fallback
+    std::env::var("CLOUD_PROVIDER")
+        .or_else(|_| std::env::var("PROVIDER"))
+        .unwrap_or_else(|_| "aws".into())
 }
