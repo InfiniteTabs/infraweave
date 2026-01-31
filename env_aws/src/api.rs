@@ -1,42 +1,89 @@
-use aws_sdk_lambda::primitives::Blob;
-use aws_sdk_lambda::types::InvocationType;
 use aws_sdk_sts::types::Credentials;
 use env_defs::{
     get_change_record_identifier, get_deployment_identifier, get_event_identifier,
     get_module_identifier, get_policy_identifier, CloudHandlerError, GenericFunctionResponse,
 };
-use env_utils::{get_epoch, sanitize_payload_for_logging, zero_pad_semver};
-use log::{error, info};
+use env_utils::{get_epoch, zero_pad_semver};
 use serde_json::{json, Value};
+
+use crate::is_http_mode_enabled;
+
+#[cfg(not(feature = "direct"))]
+use aws_sdk_lambda::primitives::Blob;
+#[cfg(not(feature = "direct"))]
+use aws_sdk_lambda::types::InvocationType;
+#[cfg(not(feature = "direct"))]
+use env_utils::sanitize_payload_for_logging;
+#[cfg(not(feature = "direct"))]
+use log::{error, info};
+
+#[cfg(feature = "direct")]
+use log::info;
 
 // Identity
 
 pub async fn get_project_id() -> Result<String, anyhow::Error> {
-    // TODO: read environment variable first and return early if set
-    let shared_config = aws_config::from_env().load().await;
-    let client = aws_sdk_sts::Client::new(&shared_config);
+    // In HTTP API mode, return dummy account ID without AWS SDK calls
+    if crate::is_http_mode_enabled() {
+        return Ok("000000000000".to_string());
+    }
 
-    let identity = client.get_caller_identity().send().await?;
-    let account_id = identity
-        .account()
-        .ok_or_else(|| anyhow::anyhow!("Account ID not found"))?;
+    if let Ok(account_id) = std::env::var("ACCOUNT_ID") {
+        return Ok(account_id);
+    }
 
-    Ok(account_id.to_string())
+    #[cfg(feature = "direct")]
+    {
+        // Local mode - return dummy account ID
+        return Ok("000000000000".to_string());
+    }
+
+    #[cfg(not(feature = "direct"))]
+    {
+        let shared_config = aws_config::from_env().load().await;
+        let client = aws_sdk_sts::Client::new(&shared_config);
+
+        let result = client
+            .get_caller_identity()
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get caller identity: {}", e))?;
+
+        Ok(result
+            .account()
+            .ok_or_else(|| anyhow::anyhow!("Account ID not found"))?
+            .to_string())
+    }
 }
 
 pub async fn get_user_id() -> Result<String, anyhow::Error> {
     if std::env::var("TEST_MODE").is_ok() {
         return Ok("test_user_id".to_string());
     };
-    let shared_config = aws_config::from_env().load().await;
-    let client = aws_sdk_sts::Client::new(&shared_config);
 
-    let identity = client.get_caller_identity().send().await?;
-    let user_id = identity
-        .arn()
-        .ok_or_else(|| anyhow::anyhow!("User ID not found"))?;
+    // HTTP mode - return placeholder, server will extract real user from JWT
+    if is_http_mode_enabled() {
+        return Ok("http-mode-user".to_string());
+    }
 
-    Ok(user_id.to_string())
+    #[cfg(feature = "direct")]
+    {
+        // Local mode - return dummy user ID
+        return Ok("arn:aws:iam::000000000000:user/local-user".to_string());
+    }
+
+    #[cfg(not(feature = "direct"))]
+    {
+        let shared_config = aws_config::from_env().load().await;
+        let client = aws_sdk_sts::Client::new(&shared_config);
+
+        let identity = client.get_caller_identity().send().await?;
+        let user_id = identity
+            .arn()
+            .ok_or_else(|| anyhow::anyhow!("User ID not found"))?;
+
+        Ok(user_id.to_string())
+    }
 }
 
 pub async fn assume_role(
@@ -60,7 +107,7 @@ pub async fn assume_role(
     Ok(creds)
 }
 
-// This will be the only used function in the module
+#[allow(dead_code)]
 pub async fn get_lambda_client(
     lambda_endpoint_url: Option<String>,
     project_id: &str,
@@ -94,6 +141,401 @@ pub async fn get_lambda_client(
     }
 }
 
+#[allow(dead_code)]
+fn get_s3_client(config: &aws_config::SdkConfig) -> aws_sdk_s3::Client {
+    let mut builder = aws_sdk_s3::config::Builder::from(config);
+    if std::env::var("AWS_S3_FORCE_PATH_STYLE")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+    {
+        builder = builder.force_path_style(true);
+    }
+    aws_sdk_s3::Client::from_conf(builder.build())
+}
+
+#[cfg(feature = "direct")]
+async fn get_s3_client_direct(region: &str) -> aws_sdk_s3::Client {
+    use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+
+    // Check for MinIO/custom S3 endpoint (local development)
+    let endpoint_opt = std::env::var("AWS_ENDPOINT_URL_S3")
+        .or_else(|_| std::env::var("MINIO_ENDPOINT"))
+        .ok();
+
+    if let Some(endpoint) = endpoint_opt {
+        // Local development mode - use MinIO/custom endpoint
+        eprintln!("Local mode: Using S3 endpoint {}", endpoint);
+
+        let credentials = Credentials::new(
+            std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "minio".to_string()),
+            std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_else(|_| "minio123".to_string()),
+            None,
+            None,
+            "local",
+        );
+
+        let config_builder = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .credentials_provider(credentials)
+            .region(Region::new(region.to_string()))
+            .force_path_style(true)
+            .endpoint_url(endpoint);
+
+        aws_sdk_s3::Client::from_conf(config_builder.build())
+    } else {
+        // Production mode - use real AWS S3 with specified region
+        let config = aws_config::from_env()
+            .region(aws_config::Region::new(region.to_string()))
+            .load()
+            .await;
+        get_s3_client(&config)
+    }
+}
+
+#[cfg(feature = "direct")]
+pub async fn run_function(
+    _function_endpoint: &Option<String>,
+    payload: &Value,
+    project_id: &str,
+    region: &str,
+) -> Result<GenericFunctionResponse, CloudHandlerError> {
+    use crate::direct_impl::{
+        get_environment_variables_direct, get_job_status_direct, insert_db_direct, read_db_direct,
+        read_logs_direct, transact_write_direct,
+    };
+    use crate::utils::get_bucket_name_from_env;
+    use aws_sdk_s3::primitives::ByteStream;
+    use base64::Engine;
+
+    let event = payload
+        .get("event")
+        .and_then(|e| e.as_str())
+        .ok_or_else(|| CloudHandlerError::OtherError("Missing event field".to_string()))?;
+
+    match event {
+        "read_db" => {
+            let table = payload
+                .get("table")
+                .and_then(|t| t.as_str())
+                .ok_or_else(|| CloudHandlerError::OtherError("Missing table field".to_string()))?;
+            let query = payload
+                .get("data")
+                .and_then(|d| d.get("query"))
+                .ok_or_else(|| CloudHandlerError::OtherError("Missing query field".to_string()))?;
+
+            match read_db_direct(table, query, Some(region)).await {
+                Ok(data) => Ok(GenericFunctionResponse { payload: data }),
+                Err(e) => Err(CloudHandlerError::OtherError(format!(
+                    "Direct DB read failed: {}",
+                    e
+                ))),
+            }
+        }
+        "get_job_status" => {
+            let job_id = payload
+                .get("data")
+                .and_then(|d| d.get("job_id"))
+                .and_then(|j| j.as_str())
+                .ok_or_else(|| CloudHandlerError::OtherError("Missing job_id field".to_string()))?;
+
+            match get_job_status_direct(job_id, Some(region)).await {
+                Ok(data) => Ok(GenericFunctionResponse { payload: data }),
+                Err(e) => Err(CloudHandlerError::OtherError(format!(
+                    "Direct get_job_status failed: {}",
+                    e
+                ))),
+            }
+        }
+        "read_logs" => {
+            let data = payload
+                .get("data")
+                .ok_or_else(|| CloudHandlerError::OtherError("Missing data field".to_string()))?;
+            let job_id = data
+                .get("job_id")
+                .and_then(|j| j.as_str())
+                .ok_or_else(|| CloudHandlerError::OtherError("Missing job_id field".to_string()))?;
+            let next_token = data.get("next_token").and_then(|t| t.as_str());
+            let limit = data.get("limit").and_then(|l| l.as_i64()).map(|l| l as i32);
+
+            match read_logs_direct(job_id, project_id, region, next_token, limit).await {
+                Ok(data) => Ok(GenericFunctionResponse { payload: data }),
+                Err(e) => Err(CloudHandlerError::OtherError(format!(
+                    "Direct read_logs failed: {}",
+                    e
+                ))),
+            }
+        }
+        "get_environment_variables" => match get_environment_variables_direct() {
+            Ok(data) => Ok(GenericFunctionResponse { payload: data }),
+            Err(e) => Err(CloudHandlerError::OtherError(format!(
+                "Direct get_environment_variables failed: {}",
+                e
+            ))),
+        },
+        "generate_presigned_url" => {
+            use aws_sdk_s3::presigning::PresigningConfig;
+            use std::time::Duration;
+
+            let data = payload
+                .get("data")
+                .ok_or_else(|| CloudHandlerError::OtherError("Missing data field".to_string()))?;
+            let key = data
+                .get("key")
+                .and_then(|k| k.as_str())
+                .ok_or_else(|| CloudHandlerError::OtherError("Missing key field".to_string()))?;
+            let bucket = data
+                .get("bucket_name")
+                .and_then(|b| b.as_str())
+                .ok_or_else(|| {
+                    CloudHandlerError::OtherError("Missing bucket_name field".to_string())
+                })?;
+
+            let actual_bucket =
+                get_bucket_name_from_env(bucket, region).unwrap_or_else(|| bucket.to_string());
+
+            let client = get_s3_client_direct(region).await;
+
+            let presigning_config = PresigningConfig::builder()
+                .expires_in(Duration::from_secs(60))
+                .build()
+                .map_err(|e| {
+                    CloudHandlerError::OtherError(format!(
+                        "Failed to build presigning config: {}",
+                        e
+                    ))
+                })?;
+
+            let presigned_request = client
+                .get_object()
+                .bucket(&actual_bucket)
+                .key(key)
+                .presigned(presigning_config)
+                .await
+                .map_err(|e| {
+                    CloudHandlerError::OtherError(format!(
+                        "Failed to generate presigned URL: {}",
+                        e
+                    ))
+                })?;
+
+            let url = presigned_request.uri().to_string();
+            Ok(GenericFunctionResponse {
+                payload: json!({ "url": url }),
+            })
+        }
+        "upload_file_base64" => {
+            let data = payload
+                .get("data")
+                .ok_or_else(|| CloudHandlerError::OtherError("Missing data field".to_string()))?;
+            let key = data
+                .get("key")
+                .and_then(|k| k.as_str())
+                .ok_or_else(|| CloudHandlerError::OtherError("Missing key field".to_string()))?;
+            let bucket = data
+                .get("bucket_name")
+                .and_then(|b| b.as_str())
+                .ok_or_else(|| {
+                    CloudHandlerError::OtherError("Missing bucket_name field".to_string())
+                })?;
+            let base64_content = data
+                .get("base64_content")
+                .and_then(|c| c.as_str())
+                .ok_or_else(|| {
+                    CloudHandlerError::OtherError("Missing base64_content field".to_string())
+                })?;
+
+            let actual_bucket =
+                get_bucket_name_from_env(bucket, region).unwrap_or_else(|| bucket.to_string());
+            log::info!(
+                "Uploading {} to {}/{} (region: {})",
+                key,
+                actual_bucket,
+                bucket,
+                region
+            );
+
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(base64_content)
+                .map_err(|e| {
+                    CloudHandlerError::OtherError(format!("Failed to decode base64: {}", e))
+                })?;
+
+            let client = get_s3_client_direct(region).await;
+
+            client
+                .put_object()
+                .bucket(&actual_bucket)
+                .key(key)
+                .body(ByteStream::from(bytes))
+                .send()
+                .await
+                .map_err(|e| {
+                    log::error!("Failed to upload {} to S3: {:?}", key, e);
+                    CloudHandlerError::OtherError(format!("Failed to upload to S3: {:?}", e))
+                })?;
+
+            log::info!("✅ Successfully uploaded {} to S3", key);
+            Ok(GenericFunctionResponse {
+                payload: json!({ "success": true, "key": key, "bucket": actual_bucket }),
+            })
+        }
+        "upload_file_url" => {
+            let data = payload
+                .get("data")
+                .ok_or_else(|| CloudHandlerError::OtherError("Missing data field".to_string()))?;
+            let key = data
+                .get("key")
+                .and_then(|k| k.as_str())
+                .ok_or_else(|| CloudHandlerError::OtherError("Missing key field".to_string()))?;
+            let bucket = data
+                .get("bucket_name")
+                .and_then(|b| b.as_str())
+                .ok_or_else(|| {
+                    CloudHandlerError::OtherError("Missing bucket_name field".to_string())
+                })?;
+            let url = data
+                .get("url")
+                .and_then(|u| u.as_str())
+                .ok_or_else(|| CloudHandlerError::OtherError("Missing url field".to_string()))?;
+
+            let actual_bucket =
+                get_bucket_name_from_env(bucket, region).unwrap_or_else(|| bucket.to_string());
+            log::info!(
+                "Downloading from {} and uploading to {}/{}",
+                url,
+                actual_bucket,
+                key
+            );
+
+            let response = reqwest::get(url).await.map_err(|e| {
+                CloudHandlerError::OtherError(format!("Failed to download from URL: {}", e))
+            })?;
+
+            let bytes = response.bytes().await.map_err(|e| {
+                CloudHandlerError::OtherError(format!("Failed to read response bytes: {}", e))
+            })?;
+
+            let client = get_s3_client_direct(region).await;
+
+            client
+                .put_object()
+                .bucket(&actual_bucket)
+                .key(key)
+                .body(ByteStream::from(bytes.to_vec()))
+                .send()
+                .await
+                .map_err(|e| {
+                    log::error!("Failed to upload {} to S3: {:?}", key, e);
+                    CloudHandlerError::OtherError(format!("Failed to upload to S3: {:?}", e))
+                })?;
+
+            log::info!("✅ Successfully uploaded {} to S3", key);
+            Ok(GenericFunctionResponse {
+                payload: json!({ "success": true, "key": key, "bucket": actual_bucket }),
+            })
+        }
+        "download_file" => {
+            let data = payload
+                .get("data")
+                .ok_or_else(|| CloudHandlerError::OtherError("Missing data field".to_string()))?;
+            let key = data
+                .get("key")
+                .and_then(|k| k.as_str())
+                .ok_or_else(|| CloudHandlerError::OtherError("Missing key field".to_string()))?;
+            let bucket = data
+                .get("bucket_name")
+                .and_then(|b| b.as_str())
+                .ok_or_else(|| {
+                    CloudHandlerError::OtherError("Missing bucket_name field".to_string())
+                })?;
+
+            let actual_bucket =
+                get_bucket_name_from_env(bucket, region).unwrap_or_else(|| bucket.to_string());
+
+            log::info!(
+                "Downloading {} from bucket {} (resolved to {})",
+                key,
+                bucket,
+                actual_bucket
+            );
+
+            let client = get_s3_client_direct(region).await;
+
+            match client
+                .get_object()
+                .bucket(&actual_bucket)
+                .key(key)
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    let bytes = response
+                        .body
+                        .collect()
+                        .await
+                        .map_err(|e| {
+                            CloudHandlerError::OtherError(format!(
+                                "Failed to read S3 object body: {}",
+                                e
+                            ))
+                        })?
+                        .into_bytes();
+
+                    let base64_content =
+                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+
+                    Ok(GenericFunctionResponse {
+                        payload: json!({ "content": base64_content }),
+                    })
+                }
+                Err(e) => {
+                    log::error!("Failed to download {}/{}: {:?}", actual_bucket, key, e);
+                    Err(CloudHandlerError::OtherError(format!(
+                        "Failed to download from S3: {}",
+                        e
+                    )))
+                }
+            }
+        }
+        "transact_write" => {
+            let items = payload
+                .get("items")
+                .ok_or_else(|| CloudHandlerError::OtherError("Missing items field".to_string()))?;
+
+            match transact_write_direct(items, Some(region)).await {
+                Ok(data) => Ok(GenericFunctionResponse { payload: data }),
+                Err(e) => Err(CloudHandlerError::OtherError(format!(
+                    "Direct transact_write failed: {}",
+                    e
+                ))),
+            }
+        }
+        "insert_db" => {
+            let table = payload
+                .get("table")
+                .and_then(|t| t.as_str())
+                .ok_or_else(|| CloudHandlerError::OtherError("Missing table field".to_string()))?;
+            let data = payload
+                .get("data")
+                .ok_or_else(|| CloudHandlerError::OtherError("Missing data field".to_string()))?;
+
+            match insert_db_direct(table, data, Some(region)).await {
+                Ok(data) => Ok(GenericFunctionResponse { payload: data }),
+                Err(e) => Err(CloudHandlerError::OtherError(format!(
+                    "Direct insert_db failed: {}",
+                    e
+                ))),
+            }
+        }
+        _ => Err(CloudHandlerError::OtherError(format!(
+            "Unknown event type: {}",
+            event
+        ))),
+    }
+}
+
+// Lambda invocation implementation - calls internal Lambda API
+#[cfg(not(feature = "direct"))]
 pub async fn run_function(
     function_endpoint: &Option<String>,
     payload: &Value,
@@ -216,6 +658,84 @@ pub async fn read_db(
         }
     });
     run_function(function_endpoint, &full_query, project_id, region).await
+}
+
+#[allow(dead_code)]
+pub async fn start_runner(event: &Value) -> Result<Value, anyhow::Error> {
+    let payload = event
+        .get("data")
+        .ok_or_else(|| anyhow::anyhow!("Missing data"))?;
+
+    let shared_config = aws_config::from_env().load().await;
+    let client = aws_sdk_ecs::Client::new(&shared_config);
+
+    // In the python code these were variables in scope, so we assume they come from env vars
+    let ecs_cluster_name = std::env::var("ECS_CLUSTER_NAME")
+        .map_err(|_| anyhow::anyhow!("ECS_CLUSTER_NAME not set"))?;
+    let ecs_task_definition = std::env::var("ECS_TASK_DEFINITION")
+        .map_err(|_| anyhow::anyhow!("ECS_TASK_DEFINITION not set"))?;
+
+    let subnet_id = std::env::var("SUBNET_ID").map_err(|_| anyhow::anyhow!("SUBNET_ID not set"))?;
+    let security_group_id = std::env::var("SECURITY_GROUP_ID")
+        .map_err(|_| anyhow::anyhow!("SECURITY_GROUP_ID not set"))?;
+
+    let cpu = payload.get("cpu").and_then(|v| v.as_str()).unwrap_or("256");
+    let memory = payload
+        .get("memory")
+        .and_then(|v| v.as_str())
+        .unwrap_or("512");
+
+    let res = client
+        .run_task()
+        .cluster(ecs_cluster_name)
+        .task_definition(ecs_task_definition)
+        .launch_type(aws_sdk_ecs::types::LaunchType::Fargate)
+        .overrides(
+            aws_sdk_ecs::types::TaskOverride::builder()
+                .cpu(cpu)
+                .memory(memory)
+                .container_overrides(
+                    aws_sdk_ecs::types::ContainerOverride::builder()
+                        .name("runner")
+                        .cpu(cpu.parse::<i32>()?)
+                        .memory(memory.parse::<i32>()?)
+                        .environment(
+                            aws_sdk_ecs::types::KeyValuePair::builder()
+                                .name("PAYLOAD")
+                                .value(serde_json::to_string(payload)?)
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build(),
+        )
+        .network_configuration(
+            aws_sdk_ecs::types::NetworkConfiguration::builder()
+                .awsvpc_configuration(
+                    aws_sdk_ecs::types::AwsVpcConfiguration::builder()
+                        .subnets(subnet_id)
+                        .security_groups(security_group_id)
+                        .assign_public_ip(aws_sdk_ecs::types::AssignPublicIp::Enabled)
+                        .build()
+                        .map_err(|e| anyhow::anyhow!(e))?,
+                )
+                .build(),
+        )
+        .count(1)
+        .send()
+        .await?;
+
+    println!("res: {:?}", res);
+
+    let job_id = res
+        .tasks
+        .as_ref()
+        .and_then(|t| t.first())
+        .and_then(|t| t.task_arn.as_ref())
+        .map(|arn| arn.split('/').last().unwrap_or(arn))
+        .ok_or_else(|| anyhow::anyhow!("Failed to retrieve task details"))?;
+
+    Ok(json!({ "job_id": job_id }))
 }
 
 pub fn get_latest_module_version_query(module: &str, track: &str) -> Value {
