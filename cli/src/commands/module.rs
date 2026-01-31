@@ -1,3 +1,4 @@
+use colored::Colorize;
 use env_common::{
     errors::ModuleError,
     logic::{deprecate_module, precheck_module, publish_module},
@@ -48,11 +49,18 @@ pub async fn handle_precheck(file: &str) {
 }
 
 pub async fn handle_list(track: &str) {
-    let modules = current_region_handler()
+    let modules = match current_region_handler()
         .await
         .get_all_latest_module(track)
         .await
-        .unwrap();
+    {
+        Ok(modules) => modules,
+        Err(e) => {
+            eprintln!("{}", format!("Error: {}", e).red());
+            std::process::exit(1);
+        }
+    };
+
     println!(
         "{:<20} {:<20} {:<20} {:<15} {:<15} {:<10}",
         "Module", "ModuleName", "Version", "Track", "Status", "Ref"
@@ -72,14 +80,25 @@ pub async fn handle_list(track: &str) {
 
 pub async fn handle_get(module: &str, version: &str) {
     let track = "dev".to_string();
-    match current_region_handler()
+    let result = match current_region_handler()
         .await
         .get_module_version(module, &track, version)
         .await
-        .unwrap()
     {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}", format!("Error: {}", e).red());
+            std::process::exit(1);
+        }
+    };
+
+    match result {
         Some(module) => {
-            println!("Module: {}", serde_json::to_string_pretty(&module).unwrap());
+            println!(
+                "Module: {}",
+                serde_json::to_string_pretty(&module)
+                    .unwrap_or_else(|_| "Failed to serialize".to_string())
+            );
             if module.deprecated {
                 println!("\n⚠️  WARNING: This module version is DEPRECATED");
                 if let Some(msg) = &module.deprecated_message {

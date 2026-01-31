@@ -500,30 +500,52 @@ impl GenericCloudHandler {
 }
 
 pub async fn initialize_project_id_and_region() -> String {
+    // Check if HTTP mode is enabled - if so, skip AWS SDK calls and output
+    let is_http_mode = env_aws::is_http_mode_enabled();
+
     if crate::logic::PROJECT_ID.get().is_none() {
         let project_id = match std::env::var("TEST_MODE") {
             Ok(_) => "test-mode".to_string(),
-            Err(_) => GenericCloudHandler::default()
-                .await
-                .provider
-                .get_project_id()
-                .to_string(),
+            Err(_) => {
+                if is_http_mode {
+                    // In HTTP mode, project_id is optional for read-only operations
+                    // If not set, use a placeholder that will cause an error only if actually used
+                    std::env::var("INFRAWEAVE_PROJECT_ID")
+                        .unwrap_or_else(|_| "http-mode-no-project".to_string())
+                } else {
+                    GenericCloudHandler::default()
+                        .await
+                        .provider
+                        .get_project_id()
+                        .to_string()
+                }
+            }
         };
-        eprintln!("Project ID: {}", &project_id);
+        if !is_http_mode {
+            eprintln!("Project ID: {}", &project_id);
+        }
         crate::logic::PROJECT_ID
             .set(project_id.clone())
             .expect("Failed to set PROJECT_ID");
     }
     if crate::logic::REGION.get().is_none() {
         let region = match std::env::var("TEST_MODE") {
-            Ok(_) => "us-west-2".to_string(),
-            Err(_) => GenericCloudHandler::default()
-                .await
-                .provider
-                .get_region()
-                .to_string(),
+            Ok(_) => std::env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".to_string()),
+            Err(_) => {
+                if is_http_mode {
+                    "us-east-1".to_string()
+                } else {
+                    GenericCloudHandler::default()
+                        .await
+                        .provider
+                        .get_region()
+                        .to_string()
+                }
+            }
         };
-        eprintln!("Region: {}", &region);
+        if !is_http_mode {
+            eprintln!("Region: {}", &region);
+        }
         crate::logic::REGION
             .set(region)
             .expect("Failed to set REGION");

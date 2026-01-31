@@ -23,6 +23,8 @@ pub use api::{
     get_current_project_query,
     get_dependents_query,
     get_deployment_and_dependents_query,
+    get_deployment_history_deleted_query,
+    get_deployment_history_plans_query,
     get_deployment_query,
     get_deployments_to_driftcheck_query,
     get_deployments_using_module_query,

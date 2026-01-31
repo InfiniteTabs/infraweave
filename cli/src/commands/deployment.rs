@@ -1,3 +1,4 @@
+use colored::Colorize;
 use log::error;
 
 use crate::current_region_handler;
@@ -6,34 +7,108 @@ use std::fs::File;
 use std::io::Write;
 
 pub async fn handle_describe(deployment_id: &str, environment: &str) {
-    let (deployment, _) = current_region_handler()
+    match current_region_handler()
         .await
         .get_deployment_and_dependents(deployment_id, environment, false)
         .await
-        .unwrap();
-    if deployment.is_some() {
-        let deployment = deployment.unwrap();
-        println!(
-            "Deployment: {}",
-            serde_json::to_string_pretty(&deployment).unwrap()
-        );
+    {
+        Ok((deployment, _)) => {
+            if let Some(deployment) = deployment {
+                println!(
+                    "Deployment: {}",
+                    serde_json::to_string_pretty(&deployment).unwrap()
+                );
+            } else {
+                eprintln!(
+                    "{}",
+                    format!("Deployment not found: {}", deployment_id).red()
+                );
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("{}", format!("Error: {}", e).red());
+            std::process::exit(1);
+        }
     }
 }
 
-pub async fn handle_list() {
-    let deployments = current_region_handler()
-        .await
-        .get_all_deployments("", false)
-        .await
-        .unwrap();
+pub async fn handle_list(project: Option<&str>, region: Option<&str>) {
+    let mut all_deployments = Vec::new();
+
+    if let (Some(p), Some(r)) = (project, region) {
+        let handler = env_common::interface::GenericCloudHandler::workload(p, r).await;
+        match handler.get_all_deployments("", false).await {
+            Ok(deps) => all_deployments.extend(deps),
+            Err(e) => {
+                eprintln!("{}", format!("Error: {}", e).red());
+                std::process::exit(1);
+            }
+        }
+    } else if let Some(p) = project {
+        // Use project with current region
+        let current_region =
+            std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        let handler =
+            env_common::interface::GenericCloudHandler::workload(p, &current_region).await;
+
+        match handler.get_all_deployments("", false).await {
+            Ok(deps) => all_deployments.extend(deps),
+            Err(e) => {
+                eprintln!("{}", format!("Error: {}", e).red());
+                std::process::exit(1);
+            }
+        }
+    } else {
+        let handler = current_region_handler().await;
+        match handler.get_all_projects().await {
+            Ok(projects) => {
+                for project_data in projects {
+                    let regions_to_check = if let Some(target_region) = region {
+                        if project_data.regions.contains(&target_region.to_string()) {
+                            vec![target_region.to_string()]
+                        } else {
+                            vec![]
+                        }
+                    } else {
+                        project_data.regions
+                    };
+
+                    for r in regions_to_check {
+                        let h = env_common::interface::GenericCloudHandler::workload(
+                            &project_data.project_id,
+                            &r,
+                        )
+                        .await;
+                        match h.get_all_deployments("", false).await {
+                            Ok(deps) => all_deployments.extend(deps),
+                            Err(e) => {
+                                error!(
+                                    "Failed to fetch deployments for {}/{}: {}",
+                                    project_data.project_id, r, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{}", format!("Error getting projects list: {}", e).red());
+                std::process::exit(1);
+            }
+        };
+    };
+
     println!(
-        "{:<15} {:<50} {:<20} {:<25} {:<40}",
-        "Status", "Deployment ID", "Module", "Version", "Environment",
+        "{:<15} {:<30} {:<15} {:<50} {:<20} {:<25} {:<40}",
+        "Status", "Project", "Region", "Deployment ID", "Module", "Version", "Environment",
     );
-    for entry in &deployments {
+    for entry in &all_deployments {
         println!(
-            "{:<15} {:<50} {:<20} {:<25} {:<40}",
+            "{:<15} {:<30} {:<15} {:<50} {:<20} {:<25} {:<40}",
             entry.status,
+            entry.project_id,
+            entry.region,
             entry.deployment_id,
             entry.module,
             format!(

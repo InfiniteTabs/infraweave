@@ -66,19 +66,22 @@ pub async fn get_lambda_client(
     project_id: &str,
     region: &str,
 ) -> (aws_sdk_lambda::Client, String) {
-    let shared_config = aws_config::from_env().load().await;
+    let region_provider = aws_config::Region::new(region.to_string());
+    let shared_config = aws_config::from_env().region(region_provider).load().await;
     match std::env::var("TEST_MODE") {
         Ok(_) => {
-            let test_region = "us-west-2";
+            let test_region = std::env::var("AWS_REGION")
+                .or_else(|_| std::env::var("TEST_REGION"))
+                .expect("AWS_REGION or TEST_REGION must be set in TEST_MODE");
             let lambda_endpoint_url =
                 lambda_endpoint_url.expect("lambda_endpoint_url variable not set");
             let test_lambda_config = aws_sdk_lambda::config::Builder::from(&shared_config)
                 .endpoint_url(lambda_endpoint_url)
-                .region(aws_config::Region::new(test_region))
+                .region(aws_config::Region::new(test_region.clone()))
                 .build();
             (
                 aws_sdk_lambda::Client::from_conf(test_lambda_config),
-                test_region.to_string(),
+                test_region,
             )
         }
         Err(_) => {
@@ -560,6 +563,68 @@ pub fn get_plan_deployment_query(
             ":deleted": 1
         }
     })
+}
+
+pub fn get_deployment_history_plans_query(
+    project_id: &str,
+    region: &str,
+    environment: Option<&str>,
+) -> Value {
+    // Use DeletedIndex to query plans by deleted_PK_base and PK prefix
+    let deleted_pk_base = format!("0|PLAN#{}::{}", project_id, region);
+    let pk_prefix = if let Some(env) = environment {
+        format!(
+            "PLAN#{}",
+            get_deployment_identifier(project_id, region, "", env)
+        )
+    } else {
+        format!("PLAN#{}::{}", project_id, region)
+    };
+
+    json!({
+        "IndexName": "DeletedIndex",
+        "KeyConditionExpression": "deleted_PK_base = :deleted_pk_base AND begins_with(PK, :pk_prefix)",
+        "ExpressionAttributeValues": {
+            ":deleted_pk_base": deleted_pk_base,
+            ":pk_prefix": pk_prefix,
+        },
+    })
+}
+
+pub fn get_deployment_history_deleted_query(
+    project_id: &str,
+    region: &str,
+    environment: Option<&str>,
+) -> Value {
+    // Use DeletedIndex with exact match on deleted_PK_base and begins_with on PK
+    let deleted_pk_base = format!("1|DEPLOYMENT#{}::{}", project_id, region);
+
+    let mut query = json!({
+        "IndexName": "DeletedIndex",
+        "KeyConditionExpression": "deleted_PK_base = :deleted_pk_base",
+        "FilterExpression": "SK = :metadata",
+        "ExpressionAttributeValues": {
+            ":deleted_pk_base": deleted_pk_base,
+            ":metadata": "METADATA",
+        },
+    });
+
+    // If environment is specified, add it to FilterExpression
+    if let Some(env) = environment {
+        let pk_prefix = format!(
+            "DEPLOYMENT#{}",
+            get_deployment_identifier(project_id, region, "", env)
+        );
+        query["FilterExpression"] = json!("SK = :metadata AND begins_with(PK, :pk_prefix)");
+        if let Some(values) = query
+            .get_mut("ExpressionAttributeValues")
+            .and_then(|v| v.as_object_mut())
+        {
+            values.insert(":pk_prefix".to_string(), json!(pk_prefix));
+        }
+    }
+
+    query
 }
 
 pub fn get_dependents_query(

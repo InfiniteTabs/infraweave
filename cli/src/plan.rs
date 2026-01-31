@@ -4,7 +4,7 @@ use anyhow::Result;
 use colored::Colorize;
 use env_common::{
     interface::{get_region_env_var, GenericCloudHandler},
-    logic::{is_deployment_in_progress, is_deployment_plan_in_progress},
+    logic::{check_deployment_progress, is_deployment_plan_in_progress},
 };
 use env_defs::{pretty_print_resource_changes, CloudProvider, DeploymentResp};
 use prettytable::{row, Table};
@@ -17,12 +17,19 @@ pub async fn follow_execution(
     job_ids: &Vec<ClaimJobStruct>,
     operation: &str, // "plan", "apply", or "destroy"
 ) -> Result<(String, String, String), anyhow::Error> {
+    use colored::*;
+
     // Keep track of statuses in a hashmap
     let mut statuses: HashMap<String, DeploymentResp> = HashMap::new();
+    let mut shown_logs: HashMap<String, bool> = HashMap::new();
+    let mut last_status: HashMap<String, String> = HashMap::new();
 
     // Polling loop to check job statuses periodically until all are finished
+    let mut failure_errors: Vec<String> = Vec::new();
+
     loop {
         let mut all_successful = true;
+        let mut any_failed = false;
 
         for claim_job in job_ids {
             if operation == "plan" {
@@ -34,52 +41,190 @@ pub async fn follow_execution(
                 )
                 .await;
 
+                // Extract short job ID for display (last part of ARN)
+                let short_job_id = job_id.split('/').last().unwrap_or(&job_id);
+
                 if in_progress {
-                    println!(
-                        "Status of job {}: {}",
-                        job_id,
-                        if in_progress {
-                            "in progress"
+                    // Only print status if it changed
+                    let status_key = format!("{}:in_progress", job_id);
+                    if last_status.get(&job_id) != Some(&status_key) {
+                        println!(
+                            "{} Task {} is {}...",
+                            "⏳".cyan(),
+                            short_job_id.cyan(),
+                            "running".cyan().bold()
+                        );
+                        last_status.insert(job_id.clone(), status_key);
+                    }
+                    all_successful = false;
+                } else {
+                    // Task completed - check if it succeeded or failed
+                    if let Some(dep) = &deployment {
+                        // Status can be "successful", "completed", "success"
+                        let status_msg = if dep.status == "completed"
+                            || dep.status == "success"
+                            || dep.status == "successful"
+                        {
+                            format!(
+                                "{} Task {} {}",
+                                "✓".green(),
+                                short_job_id.green(),
+                                "completed successfully".green().bold()
+                            )
                         } else {
-                            "completed"
+                            any_failed = true;
+                            let mut msg = format!(
+                                "{} Task {} {}",
+                                "✗".red(),
+                                short_job_id.red(),
+                                "failed".red().bold()
+                            );
+                            if !dep.error_text.is_empty() {
+                                msg.push_str(&format!(
+                                    "\n   {}: {}",
+                                    "Error".red().bold(),
+                                    dep.error_text.red()
+                                ));
+                                // Store error for final summary
+                                if !failure_errors.iter().any(|e| e == &dep.error_text) {
+                                    failure_errors.push(dep.error_text.clone());
+                                }
+                            }
+                            msg
+                        };
+
+                        let status_key = format!("{}:done", job_id);
+                        if last_status.get(&job_id) != Some(&status_key) {
+                            println!("{}", status_msg);
+                            last_status.insert(job_id.clone(), status_key);
                         }
-                    );
-                    all_successful = false;
-                }
-
-                statuses.insert(job_id.clone(), deployment.unwrap().clone());
-            } else {
-                let (in_progress, job_id, status, deployment) = is_deployment_in_progress(
-                    &GenericCloudHandler::region(&claim_job.region).await,
-                    &claim_job.deployment_id,
-                    &claim_job.environment,
-                    false,
-                    false,
-                )
-                .await;
-
-                if in_progress {
-                    println!(
-                        "Status of job {}: {} ({})",
-                        job_id,
-                        if in_progress {
-                            "in progress"
-                        } else {
-                            "completed"
-                        },
-                        status
-                    );
-                    all_successful = false;
+                    } else {
+                        // No deployment record and task not in progress = failed
+                        any_failed = true;
+                        let status_key = format!("{}:failed", job_id);
+                        if last_status.get(&job_id) != Some(&status_key) {
+                            println!(
+                                "{} Task {} {}",
+                                "✗".red(),
+                                short_job_id.red(),
+                                "failed".red().bold()
+                            );
+                            last_status.insert(job_id.clone(), status_key);
+                        }
+                    }
                 }
 
                 if let Some(dep) = deployment {
                     statuses.insert(job_id.clone(), dep);
                 }
+            } else {
+                // Apply/Destroy: Use polling logic similar to Plan, checking ECS task status
+                let (in_progress, validated_job_id, deployment) = check_deployment_progress(
+                    &GenericCloudHandler::region(&claim_job.region).await,
+                    &claim_job.deployment_id,
+                    &claim_job.environment,
+                    &claim_job.job_id, // We must use the job ID we started!
+                )
+                .await;
+
+                // Extract short job ID for display
+                let short_job_id = validated_job_id
+                    .split('/')
+                    .last()
+                    .unwrap_or(&validated_job_id);
+
+                if in_progress {
+                    let status_key = format!("{}:in_progress", validated_job_id);
+                    if last_status.get(&validated_job_id) != Some(&status_key) {
+                        println!(
+                            "{} Task {} is {}...",
+                            "⏳".cyan(),
+                            short_job_id.cyan(),
+                            "running".cyan().bold()
+                        );
+                        last_status.insert(validated_job_id.clone(), status_key);
+                    }
+                    all_successful = false;
+                } else {
+                    // Task completed - check if it succeeded or failed
+                    if let Some(dep) = &deployment {
+                        let status_msg = if dep.status == "completed"
+                            || dep.status == "success"
+                            || dep.status == "successful"
+                        {
+                            format!(
+                                "{} Task {} {}",
+                                "✓".green(),
+                                short_job_id.green(),
+                                "completed successfully".green().bold()
+                            )
+                        } else {
+                            any_failed = true;
+                            let mut msg = format!(
+                                "{} Task {} {}",
+                                "✗".red(),
+                                short_job_id.red(),
+                                "failed".red().bold()
+                            );
+                            if !dep.error_text.is_empty() {
+                                msg.push_str(&format!(
+                                    "\n   {}: {}",
+                                    "Error".red().bold(),
+                                    dep.error_text.red()
+                                ));
+                                // Store error for final summary
+                                if !failure_errors.iter().any(|e| e == &dep.error_text) {
+                                    failure_errors.push(dep.error_text.clone());
+                                }
+                            }
+                            msg
+                        };
+
+                        let status_key = format!("{}:done", validated_job_id);
+                        if last_status.get(&validated_job_id) != Some(&status_key) {
+                            println!("{}", status_msg);
+                            last_status.insert(validated_job_id.clone(), status_key);
+                        }
+                    } else {
+                        // Failed but no deployment record updated?
+                        any_failed = true;
+                        let status_key = format!("{}:failed", validated_job_id);
+                        if last_status.get(&validated_job_id) != Some(&status_key) {
+                            println!(
+                                "{} Task {} {}",
+                                "✗".red(),
+                                short_job_id.red(),
+                                "failed".red().bold()
+                            );
+                            last_status.insert(validated_job_id.clone(), status_key);
+                        }
+                    }
+                }
+
+                if let Some(dep) = deployment {
+                    // Use job_id (short) as key
+                    statuses.insert(validated_job_id.clone(), dep);
+                }
             }
         }
 
         if all_successful {
-            println!("All {} jobs are successful!", operation);
+            if any_failed {
+                println!("\n{} Some {} jobs failed!", "✗".red(), operation);
+                if !failure_errors.is_empty() {
+                    println!("\n{}", "Failure reasons:".red().bold());
+                    for (i, error) in failure_errors.iter().enumerate() {
+                        println!("  {}. {}", i + 1, error.red());
+                    }
+                }
+                return Err(anyhow::anyhow!("One or more jobs failed"));
+            } else {
+                println!(
+                    "\n{} All {} jobs completed successfully!",
+                    "✓".green(),
+                    operation
+                );
+            }
             break;
         }
 
@@ -143,17 +288,21 @@ pub async fn follow_execution(
             // Get change record for the operation (only if job didn't fail during init)
             if deployment.status != "failed_init" {
                 let record_type = operation.to_uppercase();
+                println!(
+                    "Fetching change record for job {} in region {} (type: {})",
+                    job_id, region, record_type
+                );
                 match GenericCloudHandler::region(region)
                     .await
                     .get_change_record(environment, deployment_id, job_id, &record_type)
                     .await
                 {
                     Ok(change_record) => {
-                        println!("\nOutput:\n{}", change_record.plan_std_output);
-                        std_output_table.add_row(row![
-                            format!("{}\n({})", deployment_id, environment),
-                            change_record.plan_std_output
-                        ]);
+                        // println!("\nOutput:\n{}", change_record.plan_std_output);
+                        // std_output_table.add_row(row![
+                        //     format!("{}\n({})", deployment_id, environment),
+                        //     change_record.plan_std_output
+                        // ]);
                         println!(
                             "Changes: \n{}",
                             pretty_print_resource_changes(&change_record.resource_changes)

@@ -5,7 +5,7 @@ use env_common::interface::initialize_project_id_and_region;
 use internal_api::aws_handlers as handlers;
 use internal_api::http_router;
 use lambda_runtime::{service_fn, Error, LambdaEvent};
-use log::{info, warn};
+use log::{debug, info, warn};
 use serde_json::Value;
 use tower_http::trace::TraceLayer;
 
@@ -97,10 +97,16 @@ async fn unified_handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
 
     // Try to extract user identity from API Gateway context
     if let Some(request_context) = payload.get("requestContext") {
-        // Look for claims in common locations
-        let maybe_user = request_context
+        // Debug: Log the full request context for IAM troubleshooting
+        debug!(
+            "Request context: {}",
+            serde_json::to_string_pretty(request_context).unwrap_or_else(|_| "{}".to_string())
+        );
+
+        // First try JWT/Cognito claims (for Cognito-authenticated requests)
+        let (maybe_user, maybe_allowed_projects) = request_context
             .get("authorizer")
-            .and_then(|auth| {
+            .map(|auth| {
                 // Handle both direct claims and nested jwt.claims
                 let claims = if let Some(c) = auth.get("claims") {
                     Some(c)
@@ -110,20 +116,66 @@ async fn unified_handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
                     None
                 };
 
-                claims.and_then(|c| {
+                let user = claims.and_then(|c| {
                     // Prefer Subject ID (sub) as the primary stable identifier (UUID)
                     c.get("sub")
                         .or_else(|| c.get("cognito:username"))
                         .or_else(|| c.get("email"))
-                })
+                        .and_then(|v| v.as_str())
+                });
+
+                let allowed_projects = claims.and_then(|c| {
+                    // Extract custom:allowed_projects claim
+                    c.get("custom:allowed_projects").and_then(|v| v.as_str())
+                });
+
+                (user, allowed_projects)
             })
-            .and_then(|v| v.as_str());
+            .unwrap_or((None, None));
 
         if let Some(user) = maybe_user {
-            info!("Authenticated user: {}", user);
+            info!("Authenticated user (Cognito JWT): {}", user);
             request_builder = request_builder.header("x-auth-user", user);
+
+            // Add allowed_projects header if present in JWT claims
+            if let Some(allowed_projects) = maybe_allowed_projects {
+                info!(
+                    "Adding allowed_projects from JWT claims: {}",
+                    allowed_projects
+                );
+                request_builder = request_builder.header("x-allowed-projects", allowed_projects);
+            }
         } else {
-            warn!("No user identity found in request context authorizer claims");
+            // Try IAM authentication (for IAM-signed requests to token bridge)
+            // IAM auth info is in requestContext.authorizer.iam
+            if let Some(authorizer) = request_context.get("authorizer") {
+                if let Some(iam) = authorizer.get("iam") {
+                    info!(
+                        "IAM object: {}",
+                        serde_json::to_string_pretty(iam).unwrap_or_else(|_| "{}".to_string())
+                    );
+
+                    let iam_user = iam
+                        .get("userArn")
+                        .or_else(|| iam.get("userId"))
+                        .and_then(|v| v.as_str());
+
+                    if let Some(user) = iam_user {
+                        info!("Authenticated user (IAM): {}", user);
+                        request_builder = request_builder.header("x-auth-user", user);
+                    } else {
+                        warn!("No user identity found in IAM authorizer");
+                        warn!(
+                            "Available IAM keys: {:?}",
+                            iam.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                        );
+                    }
+                } else {
+                    warn!("No IAM object found in authorizer");
+                }
+            } else {
+                warn!("No authorizer found in request context");
+            }
         }
     }
 
@@ -193,9 +245,10 @@ async fn unified_handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
     } else {
         let text = String::from_utf8_lossy(&body_bytes).to_string();
         info!(
-            "Text response (Content-Type: {}). Length: {}",
+            "Text response (Content-Type: {}). Length: {}. Body: {}",
             content_type,
-            text.len()
+            text.len(),
+            text
         );
         (text, false)
     };

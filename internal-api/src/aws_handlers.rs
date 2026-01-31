@@ -1,5 +1,7 @@
 #[cfg(feature = "aws")]
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
+#[cfg(feature = "aws")]
+use aws_sdk_dynamodb::error::ProvideErrorMetadata;
 #[cfg(feature = "aws")]
 use aws_sdk_dynamodb::operation::RequestId;
 #[cfg(feature = "aws")]
@@ -40,22 +42,62 @@ use cached::proc_macro::cached;
 
 // Helper functions to reduce boilerplate
 #[cfg(feature = "aws")]
-async fn get_aws_config() -> aws_config::SdkConfig {
-    aws_config::from_env().load().await
+async fn get_aws_config(region: Option<&str>) -> aws_config::SdkConfig {
+    let mut loader = aws_config::from_env();
+    if let Some(r) = region {
+        loader = loader.region(aws_config::Region::new(r.to_string()));
+    }
+    loader.load().await
 }
 
 #[cfg(feature = "aws")]
-async fn dynamodb_client() -> aws_sdk_dynamodb::Client {
-    aws_sdk_dynamodb::Client::new(&get_aws_config().await)
+async fn dynamodb_client(region: Option<&str>) -> aws_sdk_dynamodb::Client {
+    aws_sdk_dynamodb::Client::new(&get_aws_config(region).await)
 }
 
 #[cfg(feature = "aws")]
-async fn s3_client() -> aws_sdk_s3::Client {
-    aws_sdk_s3::Client::new(&get_aws_config().await)
+async fn s3_client(region: Option<&str>) -> aws_sdk_s3::Client {
+    #[cfg(feature = "local")]
+    {
+        // Local mode: configure for MinIO
+        use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+
+        let endpoint = std::env::var("AWS_ENDPOINT_URL_S3")
+            .or_else(|_| std::env::var("MINIO_ENDPOINT"))
+            .unwrap_or_else(|_| "http://localhost:9000".to_string());
+
+        let credentials = Credentials::new(
+            std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "minio".to_string()),
+            std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_else(|_| "minio123".to_string()),
+            None,
+            None,
+            "local",
+        );
+
+        let region_str = region
+            .map(|r| r.to_string())
+            .or_else(|| std::env::var("AWS_REGION").ok())
+            .unwrap_or_else(|| "us-west-2".to_string());
+
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .credentials_provider(credentials)
+            .region(Region::new(region_str))
+            .force_path_style(true)
+            .endpoint_url(endpoint)
+            .build();
+
+        aws_sdk_s3::Client::from_conf(config)
+    }
+
+    #[cfg(not(feature = "local"))]
+    {
+        aws_sdk_s3::Client::new(&get_aws_config(region).await)
+    }
 }
 
 #[cfg(feature = "aws")]
-pub fn get_table_name(table_type: &str) -> Result<String> {
+pub fn get_table_name(table_type: &str, region: Option<&str>) -> Result<String> {
     let env_var = match table_type.to_lowercase().as_str() {
         "events" => "DYNAMODB_EVENTS_TABLE_NAME",
         "modules" => "DYNAMODB_MODULES_TABLE_NAME",
@@ -67,7 +109,28 @@ pub fn get_table_name(table_type: &str) -> Result<String> {
         "permissions" => "DYNAMODB_PERMISSIONS_TABLE_NAME",
         _ => return Err(anyhow!("Unknown table type: {}", table_type)),
     };
-    get_env_var(env_var)
+
+    let table_name = get_env_var(env_var)?;
+
+    // If a region is specified, we check if we need to replace the region in the table name
+    if let Some(target_region) = region {
+        let current_region =
+            std::env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".to_string());
+
+        if target_region != current_region {
+            // Check if the current region is part of the table name
+            if table_name.contains(&current_region) {
+                let new_table_name = table_name.replace(&current_region, target_region);
+                info!(
+                    "Switched table name from '{}' to '{}' for region '{}'",
+                    table_name, new_table_name, target_region
+                );
+                return Ok(new_table_name);
+            }
+        }
+    }
+
+    Ok(table_name)
 }
 
 #[cfg(feature = "aws")]
@@ -82,19 +145,52 @@ pub fn get_bucket_name(bucket_type: &str) -> Result<String> {
     get_env_var(env_var)
 }
 
+pub fn get_bucket_name_for_region(bucket_type: &str, region: &str) -> Result<String> {
+    let bucket_name = get_bucket_name(bucket_type)?;
+
+    // If bucket name already contains a region, replace it
+    // Typical format: tf-change-records-{account_id}-{region}-{env}
+    // We need to replace the region part
+
+    // Get the current region from env to know what to replace
+    let current_region = get_env_var("REGION").unwrap_or_else(|_| "us-west-2".to_string());
+
+    // Replace current region with target region in bucket name
+    let updated_bucket =
+        bucket_name.replace(&format!("-{}-", current_region), &format!("-{}-", region));
+
+    info!(
+        "Bucket name for region '{}': {} -> {}",
+        region, bucket_name, updated_bucket
+    );
+
+    Ok(updated_bucket)
+}
+
 // DatabaseQuery implementation for AWS (DynamoDB)
 #[cfg(feature = "aws")]
 pub struct AwsDatabase;
 
 #[cfg(feature = "aws")]
 impl DatabaseQuery for AwsDatabase {
-    async fn query_container(&self, container: &str, query: &Value) -> Result<Value> {
-        let payload = json!({
+    async fn query_container(
+        &self,
+        container: &str,
+        query: &Value,
+        region: Option<&str>,
+    ) -> Result<Value> {
+        let mut payload = json!({
             "table": container,
             "data": {
                 "query": query
             }
         });
+
+        if let Some(r) = region {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("region".to_string(), json!(r));
+            }
+        }
 
         read_db(&payload).await
     }
@@ -107,8 +203,10 @@ pub async fn insert_db(payload: &Value) -> Result<Value> {
         .get("data")
         .ok_or_else(|| anyhow!("Missing 'data' parameter"))?;
 
-    let table_name = get_table_name(table)?;
-    let client = dynamodb_client().await;
+    let region = payload.get("region").and_then(|v| v.as_str());
+
+    let table_name = get_table_name(table, region)?;
+    let client = dynamodb_client(region).await;
     let item = json_to_dynamodb_item(data)?;
 
     let result = client
@@ -132,7 +230,10 @@ pub async fn transact_write(payload: &Value) -> Result<Value> {
         .get("items")
         .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow!("Missing 'items' array"))?;
-    let client = dynamodb_client().await;
+
+    let region = payload.get("region").and_then(|v| v.as_str());
+
+    let client = dynamodb_client(region).await;
 
     let mut transact_items = Vec::new();
 
@@ -142,7 +243,7 @@ pub async fn transact_write(payload: &Value) -> Result<Value> {
                 .get("TableName")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("Missing 'TableName' in Put operation"))?;
-            let table_name = get_table_name(table_key)?;
+            let table_name = get_table_name(table_key, region)?;
 
             let item_data = put_op
                 .get("Item")
@@ -165,7 +266,7 @@ pub async fn transact_write(payload: &Value) -> Result<Value> {
                 .get("TableName")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("Missing 'TableName' in Delete operation"))?;
-            let table_name = get_table_name(table_key)?;
+            let table_name = get_table_name(table_key, region)?;
 
             let key_data = delete_op
                 .get("Key")
@@ -210,109 +311,222 @@ pub async fn read_db(payload: &Value) -> Result<Value> {
         .and_then(|v| v.get("query"))
         .ok_or_else(|| anyhow!("Missing 'query' parameter"))?;
 
-    let table_name = get_table_name(table)?;
-    let client = dynamodb_client().await;
-    let mut query_builder = client.query().table_name(table_name);
+    let region = payload.get("region").and_then(|v| v.as_str());
 
-    if let Some(key_condition) = query_data.get("KeyConditionExpression") {
-        if let Some(expr) = key_condition.as_str() {
-            query_builder = query_builder.key_condition_expression(expr);
-        }
-    }
+    let table_name = get_table_name(table, region)?;
+    info!("Querying table '{}' in region '{:?}'", table_name, region);
 
-    if let Some(filter_expr) = query_data.get("FilterExpression") {
-        if let Some(expr) = filter_expr.as_str() {
-            query_builder = query_builder.filter_expression(expr);
-        }
-    }
+    let client = dynamodb_client(region).await;
 
-    if let Some(attr_values) = query_data.get("ExpressionAttributeValues") {
-        if let Some(obj) = attr_values.as_object() {
-            for (key, value) in obj {
-                let attr_value = to_attribute_value(value)?;
-                query_builder = query_builder.expression_attribute_values(key, attr_value);
+    // Determine if this is a Query or Scan operation
+    // Query requires KeyConditionExpression, Scan uses FilterExpression only
+    let has_key_condition = query_data.get("KeyConditionExpression").is_some();
+
+    if has_key_condition {
+        // Use Query operation
+        let mut query_builder = client.query().table_name(table_name);
+
+        if let Some(key_condition) = query_data.get("KeyConditionExpression") {
+            if let Some(expr) = key_condition.as_str() {
+                query_builder = query_builder.key_condition_expression(expr);
             }
         }
-    }
 
-    if let Some(attr_names) = query_data.get("ExpressionAttributeNames") {
-        if let Some(obj) = attr_names.as_object() {
-            for (key, value) in obj {
-                if let Some(name) = value.as_str() {
-                    query_builder = query_builder.expression_attribute_names(key, name);
+        if let Some(filter_expr) = query_data.get("FilterExpression") {
+            if let Some(expr) = filter_expr.as_str() {
+                query_builder = query_builder.filter_expression(expr);
+            }
+        }
+
+        if let Some(attr_values) = query_data.get("ExpressionAttributeValues") {
+            if let Some(obj) = attr_values.as_object() {
+                for (key, value) in obj {
+                    let attr_value = to_attribute_value(value)?;
+                    query_builder = query_builder.expression_attribute_values(key, attr_value);
                 }
             }
         }
-    }
 
-    if let Some(index_name) = query_data.get("IndexName") {
-        if let Some(name) = index_name.as_str() {
-            query_builder = query_builder.index_name(name);
-        }
-    }
-
-    if let Some(exclusive_start_key) = query_data.get("ExclusiveStartKey") {
-        if let Some(obj) = exclusive_start_key.as_object() {
-            let mut map = HashMap::new();
-            for (k, v) in obj {
-                map.insert(k.clone(), to_attribute_value(v)?);
-            }
-            query_builder = query_builder.set_exclusive_start_key(Some(map));
-        }
-    }
-
-    if let Some(limit) = query_data.get("Limit") {
-        if let Some(num) = limit.as_i64() {
-            query_builder = query_builder.limit(num as i32);
-        }
-    }
-
-    if let Some(scan_forward) = query_data.get("ScanIndexForward") {
-        if let Some(val) = scan_forward.as_bool() {
-            query_builder = query_builder.scan_index_forward(val);
-        }
-    }
-
-    let result = query_builder.send().await?;
-
-    let items: Vec<Value> = result
-        .items()
-        .iter()
-        .map(|item| from_item(item.clone()))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut response = json!({
-        "Items": items,
-        "Count": result.count(),
-    });
-
-    if let Some(last_key) = result.last_evaluated_key() {
-        if !last_key.is_empty() {
-            if let Ok(json_key) = from_item::<_, Value>(last_key.clone()) {
-                if let Ok(json_str) = serde_json::to_string(&json_key) {
-                    let token = general_purpose::STANDARD.encode(json_str);
-                    response["next_token"] = json!(token);
+        if let Some(attr_names) = query_data.get("ExpressionAttributeNames") {
+            if let Some(obj) = attr_names.as_object() {
+                for (key, value) in obj {
+                    if let Some(name) = value.as_str() {
+                        query_builder = query_builder.expression_attribute_names(key, name);
+                    }
                 }
             }
         }
-    }
 
-    if let Some(consumed_capacity) = result.consumed_capacity() {
-        response["ConsumedCapacity"] = json!({
-            "TableName": consumed_capacity.table_name(),
-            "CapacityUnits": consumed_capacity.capacity_units(),
+        if let Some(index_name) = query_data.get("IndexName") {
+            if let Some(name) = index_name.as_str() {
+                query_builder = query_builder.index_name(name);
+            }
+        }
+
+        if let Some(exclusive_start_key) = query_data.get("ExclusiveStartKey") {
+            if let Some(obj) = exclusive_start_key.as_object() {
+                let mut map = HashMap::new();
+                for (k, v) in obj {
+                    map.insert(k.clone(), to_attribute_value(v)?);
+                }
+                query_builder = query_builder.set_exclusive_start_key(Some(map));
+            }
+        }
+
+        if let Some(limit) = query_data.get("Limit") {
+            if let Some(num) = limit.as_i64() {
+                query_builder = query_builder.limit(num as i32);
+            }
+        }
+
+        if let Some(scan_forward) = query_data.get("ScanIndexForward") {
+            if let Some(val) = scan_forward.as_bool() {
+                query_builder = query_builder.scan_index_forward(val);
+            }
+        }
+
+        let result = query_builder.send().await.map_err(|e| {
+            log::error!("DynamoDB query failed: {}", e);
+            if let Some(service_err) = e.as_service_error() {
+                log::error!("Service error details: {:?}", service_err);
+                log::error!("Error message: {:?}", service_err.message());
+                log::error!("Error code: {:?}", service_err.code());
+            }
+            anyhow!("DynamoDB query failed: {}", e)
+        })?;
+
+        let items: Vec<Value> = result
+            .items()
+            .iter()
+            .map(|item| from_item(item.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut response = json!({
+            "Items": items,
+            "Count": result.count(),
         });
+
+        if let Some(last_key) = result.last_evaluated_key() {
+            if !last_key.is_empty() {
+                if let Ok(json_key) = from_item::<_, Value>(last_key.clone()) {
+                    if let Ok(json_str) = serde_json::to_string(&json_key) {
+                        let token = general_purpose::STANDARD.encode(json_str);
+                        response["next_token"] = json!(token);
+                    }
+                }
+            }
+        }
+
+        if let Some(consumed_capacity) = result.consumed_capacity() {
+            response["ConsumedCapacity"] = json!({
+                "TableName": consumed_capacity.table_name(),
+                "CapacityUnits": consumed_capacity.capacity_units(),
+            });
+        }
+
+        let elapsed = start_time.elapsed();
+        info!(
+            "DB query to table '{}' completed in {:.2}ms. Query: {}",
+            table,
+            elapsed.as_secs_f64() * 1000.0,
+            serde_json::to_string(&query_data).unwrap_or_default()
+        );
+
+        Ok(response)
+    } else {
+        // Use Scan operation
+        let mut scan_builder = client.scan().table_name(table_name);
+
+        if let Some(filter_expr) = query_data.get("FilterExpression") {
+            if let Some(expr) = filter_expr.as_str() {
+                scan_builder = scan_builder.filter_expression(expr);
+            }
+        }
+
+        if let Some(attr_values) = query_data.get("ExpressionAttributeValues") {
+            if let Some(obj) = attr_values.as_object() {
+                for (key, value) in obj {
+                    let attr_value = to_attribute_value(value)?;
+                    scan_builder = scan_builder.expression_attribute_values(key, attr_value);
+                }
+            }
+        }
+
+        if let Some(attr_names) = query_data.get("ExpressionAttributeNames") {
+            if let Some(obj) = attr_names.as_object() {
+                for (key, value) in obj {
+                    if let Some(name) = value.as_str() {
+                        scan_builder = scan_builder.expression_attribute_names(key, name);
+                    }
+                }
+            }
+        }
+
+        if let Some(exclusive_start_key) = query_data.get("ExclusiveStartKey") {
+            if let Some(obj) = exclusive_start_key.as_object() {
+                let mut map = HashMap::new();
+                for (k, v) in obj {
+                    map.insert(k.clone(), to_attribute_value(v)?);
+                }
+                scan_builder = scan_builder.set_exclusive_start_key(Some(map));
+            }
+        }
+
+        if let Some(limit) = query_data.get("Limit") {
+            if let Some(num) = limit.as_i64() {
+                scan_builder = scan_builder.limit(num as i32);
+            }
+        }
+
+        let result = scan_builder.send().await.map_err(|e| {
+            log::error!("DynamoDB scan failed: {}", e);
+            if let Some(service_err) = e.as_service_error() {
+                log::error!("Service error details: {:?}", service_err);
+                log::error!("Error message: {:?}", service_err.message());
+                log::error!("Error code: {:?}", service_err.code());
+            }
+            anyhow!("DynamoDB scan failed: {}", e)
+        })?;
+
+        let items: Vec<Value> = result
+            .items()
+            .iter()
+            .map(|item| from_item(item.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut response = json!({
+            "Items": items,
+            "Count": result.count(),
+        });
+
+        if let Some(last_key) = result.last_evaluated_key() {
+            if !last_key.is_empty() {
+                if let Ok(json_key) = from_item::<_, Value>(last_key.clone()) {
+                    if let Ok(json_str) = serde_json::to_string(&json_key) {
+                        let token = general_purpose::STANDARD.encode(json_str);
+                        response["next_token"] = json!(token);
+                    }
+                }
+            }
+        }
+
+        if let Some(consumed_capacity) = result.consumed_capacity() {
+            response["ConsumedCapacity"] = json!({
+                "TableName": consumed_capacity.table_name(),
+                "CapacityUnits": consumed_capacity.capacity_units(),
+            });
+        }
+
+        let elapsed = start_time.elapsed();
+        info!(
+            "DB scan to table '{}' completed in {:.2}ms. Query: {}",
+            table,
+            elapsed.as_secs_f64() * 1000.0,
+            serde_json::to_string(&query_data).unwrap_or_default()
+        );
+
+        Ok(response)
     }
-
-    let elapsed = start_time.elapsed();
-    info!(
-        "DB query to table '{}' completed in {:.2}ms. Query: {}",
-        table,
-        elapsed.as_secs_f64() * 1000.0,
-        serde_json::to_string(&query_data).unwrap_or_default()
-    );
-
-    Ok(response)
 }
 
 #[cfg(feature = "aws")]
@@ -320,6 +534,8 @@ pub async fn upload_file_base64(payload: &Value) -> Result<Value> {
     let data = payload
         .get("data")
         .ok_or_else(|| anyhow!("Missing 'data' parameter"))?;
+
+    let region = payload.get("region").and_then(|v| v.as_str());
 
     let bucket_key = data
         .get("bucket_name")
@@ -340,7 +556,7 @@ pub async fn upload_file_base64(payload: &Value) -> Result<Value> {
         .decode(content_base64)
         .map_err(|e| anyhow!("Failed to decode base64: {}", e))?;
 
-    let client = s3_client().await;
+    let client = s3_client(region).await;
 
     client
         .put_object()
@@ -362,6 +578,8 @@ pub async fn upload_file_url(payload: &Value) -> Result<Value> {
         .get("data")
         .ok_or_else(|| anyhow!("Missing 'data' parameter"))?;
 
+    let region = payload.get("region").and_then(|v| v.as_str());
+
     let bucket_key = data
         .get("bucket_name")
         .and_then(|v| v.as_str())
@@ -377,7 +595,7 @@ pub async fn upload_file_url(payload: &Value) -> Result<Value> {
 
     let bucket_name = get_bucket_name(bucket_key)?;
 
-    let client = s3_client().await;
+    let client = s3_client(region).await;
 
     match client
         .head_object()
@@ -411,6 +629,9 @@ pub async fn generate_presigned_url(payload: &Value) -> Result<Value> {
     let data = payload
         .get("data")
         .ok_or_else(|| anyhow!("Missing 'data' parameter"))?;
+
+    let region = payload.get("region").and_then(|v| v.as_str());
+
     let key = get_param!(data, "key");
     let bucket_key = data
         .get("bucket_name")
@@ -422,7 +643,7 @@ pub async fn generate_presigned_url(payload: &Value) -> Result<Value> {
         .unwrap_or(3600);
 
     let bucket_name = get_bucket_name(bucket_key)?;
-    let client = s3_client().await;
+    let client = s3_client(region).await;
     let presigning_config = aws_sdk_s3::presigning::PresigningConfig::expires_in(
         std::time::Duration::from_secs(expires_in as u64),
     )?;
@@ -441,28 +662,225 @@ pub async fn generate_presigned_url(payload: &Value) -> Result<Value> {
 
 #[cfg(feature = "aws")]
 pub async fn start_runner(payload: &Value) -> Result<Value> {
+    log::info!(
+        "start_runner called with payload keys: {:?}",
+        payload.as_object().map(|o| o.keys().collect::<Vec<_>>())
+    );
     let data = payload
         .get("data")
         .ok_or_else(|| anyhow!("Missing 'data' parameter"))?;
 
-    let cluster = get_env_var("ECS_CLUSTER")?;
-    let task_definition = get_env_var("ECS_TASK_DEFINITION")?;
-    let subnets = get_env_var("ECS_SUBNETS")?
-        .split(',')
-        .map(|s| s.to_string())
-        .collect::<Vec<String>>();
-    let security_groups = get_env_var("ECS_SECURITY_GROUPS")?
-        .split(',')
-        .map(|s| s.to_string())
-        .collect::<Vec<String>>();
+    // Extract project_id and region from the ApiInfraPayload directly
+    let project_id = data
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing 'project_id' in payload"))?;
+
+    let environment = get_env_var("ENVIRONMENT")?;
+
+    let region = if let Ok(r) = get_env_var("REGION") {
+        if r != "us-west-2" || environment != "dev" {
+            r
+        } else {
+            // If we are in local dev, us-west-2, we should use the payload region
+            // This is a hack for local testing to support claims in other regions
+            data.get("region")
+                .and_then(|v| v.as_str())
+                .unwrap_or("us-west-2")
+                .to_string()
+        }
+    } else {
+        // Fallback to payload region if REGION env var not set
+        data.get("region")
+            .and_then(|v| v.as_str())
+            .unwrap_or("us-west-2")
+            .to_string()
+    };
+
+    // Override region from payload if it exists, as the claim dictates where resources are
+    // But for SSM parameters, we need to know where the central infrastructure is (where SSM params are stored)
+    // The SSM parameters for workload accounts are stored in the region where the API is running (central region)
+    // Wait, no. SSM parameters describing the workload account resources (VPC, Subnets) are in the workload account.
+    // So we should be looking up SSM parameters in the region specified in the claim (payload.region).
+
+    let payload_region = data
+        .get("region")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing 'region' in payload"))?;
+
+    log::info!(
+        "Starting runner in project {} region {}",
+        project_id,
+        payload_region
+    );
+
+    // We use the payload region for setting up the clients because that's where the workload resources are
+    let region = payload_region;
 
     let cpu = data.get("cpu").and_then(|v| v.as_str()).unwrap_or("256");
     let memory = data.get("memory").and_then(|v| v.as_str()).unwrap_or("512");
 
-    let config = get_aws_config().await;
-    let ecs_client = aws_sdk_ecs::Client::new(&config);
+    // Always assume role into the workload account to launch ECS task
+    log::info!(
+        "Assuming role in workload account {} to launch ECS task",
+        project_id
+    );
+    // Explicitly use the region from payload/env for the STS client client logic as well
+    // passing None might default to something else if AWS_REGION is set to something else
+    let config = get_aws_config(Some(&region)).await;
+    let sts_client = aws_sdk_sts::Client::new(&config);
 
-    let mut environment = Vec::new();
+    let role_arn = format!(
+        "arn:aws:iam::{}:role/infraweave_api_execute_runner-{}",
+        project_id, environment
+    );
+    log::info!("Assuming role: {}", role_arn);
+
+    let assumed_role = sts_client
+        .assume_role()
+        .role_arn(&role_arn)
+        .role_session_name("CentralApiLaunchRunnerSession")
+        .send()
+        .await
+        .map_err(|e| {
+            log::error!("Failed to assume role {}: {:?}", role_arn, e);
+            anyhow!("Failed to assume role to launch runner: {:?}", e)
+        })?;
+
+    let credentials = assumed_role
+        .credentials()
+        .ok_or_else(|| anyhow!("No credentials returned from assume role"))?;
+
+    log::info!("Successfully assumed role in workload account");
+
+    // Create new config with assumed role credentials
+    use aws_credential_types::Credentials;
+    let creds = Credentials::new(
+        credentials.access_key_id(),
+        credentials.secret_access_key(),
+        Some(credentials.session_token().to_string()),
+        None,
+        "AssumedRole",
+    );
+
+    let new_config = aws_config::SdkConfig::builder()
+        .credentials_provider(aws_credential_types::provider::SharedCredentialsProvider::new(creds))
+        .region(aws_config::Region::new(region.to_string()))
+        .behavior_version(aws_config::BehaviorVersion::latest())
+        .build();
+
+    let ecs_client = aws_sdk_ecs::Client::new(&new_config);
+    let ssm_client = aws_sdk_ssm::Client::new(&new_config);
+
+    // Fetch configuration from SSM Parameter Store in the workload account
+    log::info!("Fetching configuration from SSM Parameter Store");
+
+    let cluster_param = format!(
+        "/infraweave/{}/{}/workload_ecs_cluster_name",
+        region, environment
+    );
+    let subnets_param = format!(
+        "/infraweave/{}/{}/workload_ecs_subnet_id",
+        region, environment
+    );
+    let sg_param = format!(
+        "/infraweave/{}/{}/workload_ecs_security_group",
+        region, environment
+    );
+
+    let cluster_result = ssm_client
+        .get_parameter()
+        .name(&cluster_param)
+        .send()
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "Failed to get cluster name from SSM parameter {}: {:?}",
+                cluster_param,
+                e
+            )
+        })?;
+
+    let subnets_result = ssm_client
+        .get_parameter()
+        .name(&subnets_param)
+        .send()
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "Failed to get subnets from SSM parameter {}: {:?}",
+                subnets_param,
+                e
+            )
+        })?;
+
+    let sg_result = ssm_client
+        .get_parameter()
+        .name(&sg_param)
+        .send()
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "Failed to get security groups from SSM parameter {}: {}",
+                sg_param,
+                e
+            )
+        })?;
+
+    let cluster = cluster_result
+        .parameter()
+        .and_then(|p| p.value())
+        .ok_or_else(|| anyhow!("No cluster name value in SSM parameter"))?
+        .to_string();
+
+    let subnets: Vec<String> = subnets_result
+        .parameter()
+        .and_then(|p| p.value())
+        .ok_or_else(|| anyhow!("No subnets value in SSM parameter"))?
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
+
+    let security_groups: Vec<String> = sg_result
+        .parameter()
+        .and_then(|p| p.value())
+        .ok_or_else(|| anyhow!("No security groups value in SSM parameter"))?
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
+
+    // Use standard task definition naming
+    let task_definition = format!("infraweave-runner-{}", environment);
+
+    log::info!(
+        "Retrieved config - cluster: {}, task_definition: {}, subnets: {:?}, security_groups: {:?}",
+        cluster,
+        task_definition,
+        subnets,
+        security_groups
+    );
+
+    // Pass ApiInfraPayload as PAYLOAD env var (no variables to avoid size limits)
+    // Variables are stored in database and retrieved by runner
+    let payload_json = serde_json::to_string(data)?;
+
+    log::info!(
+        "Payload to send to runner (first 200 chars): {}",
+        if payload_json.len() > 200 {
+            &payload_json[..200]
+        } else {
+            &payload_json
+        }
+    );
+
+    let payload_env = aws_sdk_ecs::types::KeyValuePair::builder()
+        .name("PAYLOAD")
+        .value(payload_json)
+        .build();
+
+    let mut environment = vec![payload_env];
+
+    // Also include any additional environment variables from the payload
     if let Some(env_vars) = data.get("environment") {
         if let Some(obj) = env_vars.as_object() {
             for (key, value) in obj {
@@ -506,7 +924,8 @@ pub async fn start_runner(payload: &Value) -> Result<Value> {
         .network_configuration(network_config)
         .overrides(task_override)
         .send()
-        .await?;
+        .await
+        .map_err(|e| anyhow!("Failed to run ECS task: {:?}", e))?;
 
     let task_arn = result
         .tasks()
@@ -514,7 +933,10 @@ pub async fn start_runner(payload: &Value) -> Result<Value> {
         .and_then(|t| t.task_arn())
         .ok_or_else(|| anyhow!("No task ARN returned"))?;
 
+    log::info!("Successfully launched ECS task: {}", task_arn);
+
     Ok(json!({
+        "task_arn": task_arn,
         "job_id": task_arn.split('/').last().unwrap_or(task_arn)
     }))
 }
@@ -529,10 +951,79 @@ pub async fn get_job_status(payload: &Value) -> Result<Value> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Missing 'job_id' parameter"))?;
 
-    let cluster = get_env_var("ECS_CLUSTER")?;
+    let project_id = data
+        .get("project")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing 'project' parameter"))?;
 
-    let config = get_aws_config().await;
-    let ecs_client = aws_sdk_ecs::Client::new(&config);
+    let region = data
+        .get("region")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing 'region' parameter"))?;
+
+    // Get environment from ECS_ENVIRONMENT env var or default to "prod"
+    let environment = std::env::var("ECS_ENVIRONMENT").unwrap_or_else(|_| "prod".to_string());
+
+    // Assume read-only role in the workload account to check task status
+    let role_arn = format!(
+        "arn:aws:iam::{}:role/infraweave_api_read_log-{}",
+        project_id, environment
+    );
+
+    let config = get_aws_config(None).await;
+    let sts_client = aws_sdk_sts::Client::new(&config);
+
+    let assumed_role = sts_client
+        .assume_role()
+        .role_arn(&role_arn)
+        .role_session_name("infraweave-job-status-check")
+        .send()
+        .await
+        .context(format!("Failed to assume role: {}", role_arn))?;
+
+    let credentials = assumed_role
+        .credentials()
+        .ok_or_else(|| anyhow!("No credentials returned from AssumeRole"))?;
+
+    // Create new config with assumed role credentials in the specified region
+    use aws_credential_types::Credentials;
+
+    let creds = Credentials::new(
+        credentials.access_key_id(),
+        credentials.secret_access_key(),
+        Some(credentials.session_token().to_string()),
+        None,
+        "assumed-role",
+    );
+
+    let assumed_config = aws_config::SdkConfig::builder()
+        .credentials_provider(aws_credential_types::provider::SharedCredentialsProvider::new(creds))
+        .region(aws_config::Region::new(region.to_string()))
+        .behavior_version(aws_config::BehaviorVersion::latest())
+        .build();
+
+    // Get cluster name from SSM Parameter Store
+    let ssm_client = aws_sdk_ssm::Client::new(&assumed_config);
+    let cluster_param_name = format!(
+        "/infraweave/{}/{}/workload_ecs_cluster_name",
+        region, environment
+    );
+
+    let cluster = ssm_client
+        .get_parameter()
+        .name(&cluster_param_name)
+        .send()
+        .await
+        .context(format!(
+            "Failed to get SSM parameter: {}",
+            cluster_param_name
+        ))?
+        .parameter()
+        .and_then(|p| p.value())
+        .ok_or_else(|| anyhow!("SSM parameter {} has no value", cluster_param_name))?
+        .to_string();
+
+    let ecs_client = aws_sdk_ecs::Client::new(&assumed_config);
 
     let result = ecs_client
         .describe_tasks()
@@ -549,9 +1040,23 @@ pub async fn get_job_status(payload: &Value) -> Result<Value> {
     let status = task.last_status().unwrap_or("UNKNOWN");
     let stopped_reason = task.stopped_reason().unwrap_or("");
 
+    // Check for exit code of the essential container
+    let containers = task.containers();
+    let exit_code = if let Some(runner) = containers.iter().find(|c| c.name() == Some("runner")) {
+        runner.exit_code().unwrap_or(0)
+    } else {
+        // Fallback: check if any container failed
+        containers
+            .iter()
+            .filter_map(|c| c.exit_code())
+            .find(|&code| code != 0)
+            .unwrap_or(0)
+    };
+
     Ok(json!({
         "status": status,
-        "stopped_reason": stopped_reason
+        "stopped_reason": stopped_reason,
+        "exit_code": exit_code
     }))
 }
 
@@ -621,11 +1126,11 @@ pub async fn read_logs(payload: &Value) -> Result<Value> {
     // Check if we need to assume a role in the target project account
     let client = if central_account_id == project_id {
         log::info!("Using current account credentials (central account)");
-        let config = get_aws_config().await;
+        let config = get_aws_config(None).await;
         aws_sdk_cloudwatchlogs::Client::new(&config)
     } else {
         log::info!("Assuming role in target account: {}", project_id);
-        let config = get_aws_config().await;
+        let config = get_aws_config(None).await;
         let sts_client = aws_sdk_sts::Client::new(&config);
 
         let role_arn = format!(
@@ -767,7 +1272,7 @@ pub async fn publish_notification(payload: &Value) -> Result<Value> {
 
     let topic_arn = get_env_var("NOTIFICATION_TOPIC_ARN")?;
 
-    let config = get_aws_config().await;
+    let config = get_aws_config(None).await;
     let sns_client = aws_sdk_sns::Client::new(&config);
 
     let mut request = sns_client.publish().topic_arn(topic_arn).message(message);
@@ -805,7 +1310,16 @@ fn json_to_dynamodb_item(
 
 #[cfg(feature = "aws")]
 pub async fn download_file_as_string(bucket_name: &str, key: &str) -> Result<String> {
-    let client = s3_client().await;
+    download_file_as_string_from_region(bucket_name, key, None).await
+}
+
+#[cfg(feature = "aws")]
+pub async fn download_file_as_string_from_region(
+    bucket_name: &str,
+    key: &str,
+    region: Option<&str>,
+) -> Result<String> {
+    let client = s3_client(region).await;
     let object = client
         .get_object()
         .bucket(bucket_name)
@@ -820,7 +1334,16 @@ pub async fn download_file_as_string(bucket_name: &str, key: &str) -> Result<Str
 
 #[cfg(feature = "aws")]
 pub async fn download_file(bucket_name: &str, key: &str) -> Result<Response> {
-    let client = s3_client().await;
+    download_file_from_region(bucket_name, key, None).await
+}
+
+#[cfg(feature = "aws")]
+pub async fn download_file_from_region(
+    bucket_name: &str,
+    key: &str,
+    region: Option<&str>,
+) -> Result<Response> {
+    let client = s3_client(region).await;
     let object = client
         .get_object()
         .bucket(bucket_name)
@@ -878,169 +1401,83 @@ pub async fn download_file(bucket_name: &str, key: &str) -> Result<Response> {
 // Graph handlers moved to handlers.rs
 
 #[cfg(feature = "aws")]
+pub async fn download_provider(payload: &Value) -> Result<Value> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+    let s3_key = payload
+        .get("s3_key")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing 's3_key' parameter"))?;
+
+    info!("Downloading provider from S3: {}", s3_key);
+
+    let bucket_name = get_bucket_name("modules")?;
+    let client = s3_client(None).await;
+
+    let result = client
+        .get_object()
+        .bucket(&bucket_name)
+        .key(s3_key)
+        .send()
+        .await
+        .map_err(|e| anyhow!("Failed to download provider from S3: {}", e))?;
+
+    let bytes = result
+        .body
+        .collect()
+        .await
+        .map_err(|e| anyhow!("Failed to read S3 object body: {}", e))?;
+
+    let zip_bytes = bytes.into_bytes();
+    let zip_base64 = BASE64.encode(&zip_bytes);
+
+    Ok(json!({
+        "zip_base64": zip_base64
+    }))
+}
+
+#[cfg(feature = "aws")]
 pub async fn publish_module(payload: &Value) -> Result<Value> {
-    use base64::Engine;
-    use env_common::interface::GenericCloudHandler;
-    use env_common::logic::publish_module as publish_module_impl;
-    use env_defs::{get_publish_job_identifier, PublishJob};
-    use env_utils::{tempdir, unzip_vec_to};
+    use env_common::logic::upload_module;
+    use env_defs::{CloudProvider, ModuleResp};
 
-    let data = payload
-        .get("data")
-        .ok_or_else(|| anyhow!("Missing 'data' parameter"))?;
-
-    let zip_base64 = data
+    let zip_base64 = payload
         .get("zip_base64")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Missing 'zip_base64' parameter"))?;
-    let track = data
-        .get("track")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("Missing 'track' parameter"))?;
-    let version = data.get("version").and_then(|v| v.as_str());
-    let job_id = data
-        .get("job_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("Missing 'job_id' parameter"))?;
 
-    // Create initial job record
-    let job = PublishJob::new(job_id.to_string());
-    let job_key = get_publish_job_identifier(job_id);
+    let module_json = payload
+        .get("module")
+        .ok_or_else(|| anyhow!("Missing 'module' parameter"))?;
 
-    // Store job in DynamoDB
-    let client = dynamodb_client().await;
-    let table_name = get_table_name("jobs")?;
+    // Deserialize the module metadata
+    let module: ModuleResp = serde_json::from_value(module_json.clone())
+        .map_err(|e| anyhow!("Failed to deserialize module: {}", e))?;
 
-    client
-        .put_item()
-        .table_name(&table_name)
-        .item(
-            "pk",
-            aws_sdk_dynamodb::types::AttributeValue::S(job_key.clone()),
-        )
-        .item(
-            "job_id",
-            aws_sdk_dynamodb::types::AttributeValue::S(job.job_id.clone()),
-        )
-        .item(
-            "status",
-            aws_sdk_dynamodb::types::AttributeValue::S("processing".to_string()),
-        )
-        .item(
-            "created_at",
-            aws_sdk_dynamodb::types::AttributeValue::N(job.created_at.to_string()),
-        )
-        .item(
-            "ttl",
-            aws_sdk_dynamodb::types::AttributeValue::N(job.ttl.to_string()),
-        )
-        .send()
-        .await?;
+    info!(
+        "Uploading module {} version {} to all regions",
+        module.module, module.version
+    );
 
-    // Do the work synchronously
-    let result: Result<(), anyhow::Error> = async {
-        // Decode base64 to get zip bytes
-        let zip_bytes = general_purpose::STANDARD
-            .decode(zip_base64)
-            .map_err(|e| anyhow!("Failed to decode base64: {}", e))?;
+    // Get handler using default (uses AWS SDK config from environment)
+    let handler = env_common::interface::GenericCloudHandler::default().await;
+    let all_regions = handler.get_all_regions().await?;
 
-        // Create a temporary directory to extract the module
-        let temp_dir = tempdir().map_err(|e| anyhow!("Failed to create temp directory: {}", e))?;
-        let temp_path = temp_dir.path();
-
-        // Extract zip to temporary directory
-        unzip_vec_to(&zip_bytes, temp_path)
-            .map_err(|e| anyhow!("Failed to extract zip file: {}", e))?;
-
-        info!("Extracted files to: {:?}", temp_path);
-        if let Ok(entries) = std::fs::read_dir(temp_path) {
-            for entry in entries.flatten() {
-                info!("  - {:?}", entry.file_name());
-            }
-        }
-
-        // Create a GenericCloudHandler for AWS
-        let handler = GenericCloudHandler::default().await;
-
-        // Call publish_module logic with the extracted directory path
-        publish_module_impl(
-            &handler,
-            temp_path
-                .to_str()
-                .ok_or_else(|| anyhow!("Invalid temp path"))?,
-            track,
-            version,
-            None,
-        )
-        .await
-        .map_err(|e| anyhow!("Failed to publish module: {}", e))?;
-
-        Ok(())
+    // Upload module to all regions
+    for region in all_regions.iter() {
+        let region_handler = handler.copy_with_region(region).await;
+        upload_module(&region_handler, &module, &zip_base64.to_string())
+            .await
+            .map_err(|e| anyhow!("Failed to upload module to region {}: {}", region, e))?;
+        info!("Module uploaded to region {}", region);
     }
-    .await;
 
-    // Update job status based on result
-    match result {
-        Ok(()) => {
-            client
-                .update_item()
-                .table_name(&table_name)
-                .key(
-                    "pk",
-                    aws_sdk_dynamodb::types::AttributeValue::S(job_key.clone()),
-                )
-                .update_expression("SET #status = :status, #result = :result")
-                .expression_attribute_names("#status", "status")
-                .expression_attribute_names("#result", "result")
-                .expression_attribute_values(
-                    ":status",
-                    aws_sdk_dynamodb::types::AttributeValue::S("completed".to_string()),
-                )
-                .expression_attribute_values(
-                    ":result",
-                    aws_sdk_dynamodb::types::AttributeValue::S(
-                        serde_json::to_string(&json!({
-                            "track": track,
-                            "version": version
-                        }))
-                        .unwrap_or_default(),
-                    ),
-                )
-                .send()
-                .await?;
+    info!("Module uploaded successfully to all regions");
 
-            Ok(json!({
-                "job_id": job_id,
-                "status": "completed"
-            }))
-        }
-        Err(e) => {
-            log::error!("Publish module failed: {}", e);
-            client
-                .update_item()
-                .table_name(&table_name)
-                .key("pk", aws_sdk_dynamodb::types::AttributeValue::S(job_key))
-                .update_expression("SET #status = :status, #error = :error")
-                .expression_attribute_names("#status", "status")
-                .expression_attribute_names("#error", "error")
-                .expression_attribute_values(
-                    ":status",
-                    aws_sdk_dynamodb::types::AttributeValue::S("failed".to_string()),
-                )
-                .expression_attribute_values(
-                    ":error",
-                    aws_sdk_dynamodb::types::AttributeValue::S(e.to_string()),
-                )
-                .send()
-                .await?;
-
-            Ok(json!({
-                "job_id": job_id,
-                "status": "failed",
-                "error": e.to_string()
-            }))
-        }
-    }
+    Ok(json!({
+        "status": "success",
+        "message": format!("Module {} version {} uploaded", module.module, module.version)
+    }))
 }
 
 #[cfg(feature = "aws")]
@@ -1055,8 +1492,8 @@ pub async fn get_publish_job_status(payload: &Value) -> Result<Value> {
     let job_key = get_publish_job_identifier(job_id);
 
     // Query DynamoDB for job status
-    let client = dynamodb_client().await;
-    let table_name = get_table_name("jobs")?;
+    let client = dynamodb_client(None).await;
+    let table_name = get_table_name("jobs", None)?;
 
     let result = client
         .get_item()
@@ -1087,8 +1524,8 @@ pub async fn get_user_allowed_projects(user_id: &str) -> Result<Vec<String>> {
         user_id
     );
     // 1. Get the table name
-    let table_name = get_table_name("permissions")?;
-    let client = dynamodb_client().await;
+    let table_name = get_table_name("permissions", None)?;
+    let client = dynamodb_client(None).await;
 
     // 2. Query the permissions table for the user
     // Assumes Schema: PK = "user_id"
@@ -1128,5 +1565,3 @@ pub async fn check_project_access(user_id: &str, project_id: &str) -> Result<boo
     let allowed = get_user_allowed_projects(user_id).await?;
     Ok(allowed.contains(&project_id.to_string()))
 }
-
-// check_user_access removed in favor of get_user_allowed_projects list lookup

@@ -19,7 +19,24 @@ pub fn render_loading(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Render navigation menu bar
 pub fn render_navigation(frame: &mut Frame, area: Rect, app: &App) {
-    let widget = NavigationBar::new(&app.current_view, &app.project_id, &app.region);
+    // If a project filter is selected, show that instead of the context project ID
+    let display_project_id = app
+        .selected_project_filter
+        .as_deref()
+        .unwrap_or(&app.project_id);
+
+    // If a region filter is selected, show that. Otherwise show "All Regions" since we default to showing all.
+    let display_region = app
+        .selected_region_filter
+        .as_deref()
+        .unwrap_or("All Regions");
+
+    let widget = NavigationBar::new(
+        &app.current_view,
+        display_project_id,
+        display_region,
+        app.available_projects.len(),
+    );
     widget.render(frame, area);
 }
 
@@ -62,7 +79,8 @@ pub fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 
     let count = match app.current_view {
         View::Modules => format!(" • {} items", app.modules.len()),
-        View::Deployments => format!(" • {} items", app.deployments.len()),
+        // View::Deployments => format!(" • {} items", app.deployments.len()),
+        View::Deployments => format!(" • {} items", app.get_filtered_deployments().len()),
         _ => String::new(),
     };
 

@@ -6,10 +6,10 @@ use axum::{
     routing::{get, post, put},
     Router,
 };
+use log::error;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::handlers;
@@ -43,13 +43,31 @@ async fn handle_result(result: anyhow::Result<Value>) -> impl IntoResponse {
             // Default behavior for non-list responses
             (StatusCode::OK, Json(response)).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": format!("{}", e)
-            })),
-        )
-            .into_response(),
+        Err(e) => {
+            let err_msg = e.to_string();
+            let status = if err_msg.to_lowercase().contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                error!("Request failed: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+
+            // Include full error details (including cause chain) for internal server errors
+            // This aids debugging client-side when using the API directly
+            let response_msg = if status == StatusCode::INTERNAL_SERVER_ERROR {
+                format!("{:?}", e)
+            } else {
+                err_msg
+            };
+
+            (
+                status,
+                Json(json!({
+                    "error": response_msg
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -98,6 +116,15 @@ pub fn create_router() -> Router {
             "/api/v1/deployments/module/:project/:region/:module",
             get(get_deployments_for_module),
         )
+        .route(
+            "/api/v1/deployments/history/:project/:region",
+            get(get_deployments_history),
+        )
+        // Specific endpoint for deployment plan status by job_id
+        .route(
+            "/api/v1/plan/:project/:region/*rest",
+            get(describe_plan_deployment),
+        )
         .route("/api/v1/logs/:project/:region/:job_id", get(read_logs))
         .route("/api/v1/events/:project/:region/*rest", get(get_events))
         .route(
@@ -112,6 +139,15 @@ pub fn create_router() -> Router {
             "/api/v1/deployment_graph/:project/:region/*rest",
             get(get_deployment_graph),
         )
+        // Provider download route - returns base64 content (requires auth)
+        .route("/api/v1/provider/download", post(download_provider))
+        // Plan/Apply/Destroy operations
+        .route("/api/v1/claim/run", post(run_claim))
+        // Job status route - use wildcard to handle ARNs with slashes
+        .route(
+            "/api/v1/job_status/:project/:region/*rest",
+            get(get_job_status_http),
+        )
         .layer(middleware::from_fn(auth_middleware));
 
     // Open routes / Global lookups
@@ -120,6 +156,12 @@ pub fn create_router() -> Router {
             "/2015-03-31/functions/:function_name/invocations",
             post(handlers::handle_lambda_invocation),
         )
+        // Authentication / Token bridge route
+        .route("/api/v1/auth/token", post(get_token_for_iam_user))
+        // Meta endpoint for region discovery
+        // MUST be unauthenticated to allow clients to discover region via Latency Based Routing
+        // before they can sign requests with the correct region.
+        .route("/api/v1/meta", get(get_meta_info))
         .route("/api/v1/modules", get(get_modules))
         .route("/api/v1/projects", get(get_projects))
         .route("/api/v1/stacks", get(get_stacks))
@@ -167,7 +209,7 @@ pub fn create_router() -> Router {
             "/api/v1/module/:track/:module/:version/deprecate",
             put(deprecate_module),
         )
-        // Module publish route
+        // Module publish route - accepts pre-built modules
         .route("/api/v1/module/publish", post(publish_module))
         // Job status route
         .route(
@@ -179,7 +221,50 @@ pub fn create_router() -> Router {
         .merge(protected_routes)
         // Add CORS layer
         .layer(cors)
-        .layer(CompressionLayer::new())
+    // NOTE: CompressionLayer removed because API Gateway v2 HTTP API strips the
+    // Content-Encoding header, causing clients to receive compressed data without
+    // knowing it's compressed. Use CloudFront for compression instead.
+}
+
+/// Extract and decode JWT token from Authorization header without signature validation
+/// This is safe for local development because we're just reading claims from the token
+/// In production, API Gateway validates the token before it reaches us
+fn extract_jwt_claims(headers: &HeaderMap) -> Option<Value> {
+    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok())?;
+
+    // Remove "Bearer " prefix
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .or_else(|| auth_header.strip_prefix("bearer "))?;
+
+    // JWT format: header.payload.signature
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        log::warn!("Invalid JWT format: expected 3 parts, got {}", parts.len());
+        return None;
+    }
+
+    // Decode the payload (second part) without verification
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let payload_bytes = match URL_SAFE_NO_PAD.decode(parts[1]) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::warn!("Failed to decode JWT payload: {}", e);
+            return None;
+        }
+    };
+
+    match serde_json::from_slice(&payload_bytes) {
+        Ok(claims) => Some(claims),
+        Err(e) => {
+            log::error!("Failed to parse JWT claims as JSON: {}", e);
+            log::debug!(
+                "Raw payload bytes: {:?}",
+                String::from_utf8_lossy(&payload_bytes)
+            );
+            None
+        }
+    }
 }
 
 async fn ensure_access(
@@ -187,6 +272,33 @@ async fn ensure_access(
     project_id: &str,
 ) -> Result<(), (StatusCode, axum::response::Json<serde_json::Value>)> {
     if let Some(user_id) = headers.get("x-auth-user").and_then(|v| v.to_str().ok()) {
+        // Extract JWT claims from Authorization header
+        if let Some(claims) = extract_jwt_claims(headers) {
+            // Check for custom:allowed_projects in JWT claims
+            if let Some(allowed_projects_str) = claims
+                .get("custom:allowed_projects")
+                .and_then(|v| v.as_str())
+            {
+                let allowed_projects: Vec<String> = allowed_projects_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                if allowed_projects.contains(&project_id.to_string()) {
+                    return Ok(());
+                } else {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error": "Access denied to this project"
+                        })),
+                    ));
+                }
+            }
+        }
+
+        // Fallback to database check (legacy method)
         match handlers::check_project_access(user_id, project_id).await {
             Ok(true) => Ok(()),
             Ok(false) => Err((
@@ -224,6 +336,65 @@ async fn ensure_access(
 }
 
 // Handler implementations
+
+async fn describe_plan_deployment(
+    Path((project, region, rest)): Path<(String, String, String)>,
+) -> impl IntoResponse {
+    // Expected format: environment1/environment2/deployment1/deployment2/job_id
+    // But since environment/deployment can contain slashes, we need to be careful
+    // However, in api_infra logic it passes: deployment_id, environment, job_id
+    // The previous http_describe_deployment expected env/dep
+    // Let's adopt a convention: /api/v1/plan/{project}/{region}/{env}/{dep}/{job_id}
+    // But env and dep can have slashes.
+
+    // Safer to split by slash and take last segment as job_id
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.len() < 3 {
+        // minimal: env/dep/job_id (Assuming env and dep are at least 1 segment)
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("Invalid path format. Expected .../environment/deployment/job_id, got {}", rest)
+            })),
+        )
+            .into_response();
+    }
+
+    let job_id = parts.last().unwrap().to_string();
+
+    // The rest before job_id is env+deployment.
+    // We kow from describe_deployment:
+    // environment = parts[0]/parts[1]
+    // deployment_id = parts[2]/parts[3]
+    // And here we add job_id as parts[4]
+
+    // Let's assume the standard 2-segment structure if possible, but match what describe_deployment does
+    if parts.len() != 5 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("Invalid path format. Expected exactly 5 segments (env1/env2/dep1/dep2/job_id), got {}", parts.len())
+            })),
+        )
+            .into_response();
+    }
+
+    let environment = format!("{}/{}", parts[0], parts[1]);
+    let deployment_id = format!("{}/{}", parts[2], parts[3]);
+
+    handle_result(
+        handlers::describe_plan_deployment(&json!({
+            "project": project,
+            "region": region,
+            "environment": environment,
+            "deployment_id": deployment_id,
+            "job_id": job_id
+        }))
+        .await,
+    )
+    .await
+    .into_response()
+}
 
 async fn describe_deployment(
     Path((project, region, rest)): Path<(String, String, String)>,
@@ -321,10 +492,45 @@ async fn get_deployments_for_module(
         .into_response()
 }
 
+async fn get_deployments_history(
+    Path((project, region)): Path<(String, String)>,
+    Query(query): Query<DeploymentHistoryQuery>,
+) -> impl IntoResponse {
+    let mut payload = json!({
+        "project": project,
+        "region": region
+    });
+
+    if let Some(environment) = query.environment {
+        payload["environment"] = json!(environment);
+    }
+
+    payload["type"] = json!(query.r#type);
+
+    if let Some(limit) = query.limit {
+        payload["limit"] = json!(limit);
+    }
+    if let Some(next_token) = query.next_token {
+        payload["next_token"] = json!(next_token);
+    }
+
+    handle_result(handlers::get_deployment_history(&payload).await)
+        .await
+        .into_response()
+}
+
 #[derive(Deserialize)]
 struct PaginationQuery {
     limit: Option<i64>,
     next_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeploymentHistoryQuery {
+    limit: Option<i64>,
+    next_token: Option<String>,
+    environment: Option<String>,
+    r#type: String, // "plans" or "deleted" (required)
 }
 
 #[derive(Deserialize)]
@@ -579,19 +785,50 @@ async fn get_projects(
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
     let user_id = match headers.get("x-auth-user").and_then(|v| v.to_str().ok()) {
-        Some(uid) => uid,
+        Some(uid) => uid.to_string(),
         None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "Missing authentication user context" })),
-            )
-                .into_response()
+            #[cfg(feature = "local")]
+            {
+                log::warn!("Missing x-auth-user header, using 'local-user' (LOCAL MODE ONLY)");
+                "local-user".to_string()
+            }
+            #[cfg(not(feature = "local"))]
+            {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "Missing authentication user context" })),
+                )
+                    .into_response();
+            }
         }
     };
 
     let mut payload = json!({
         "user_id": user_id
     });
+
+    // Extract allowed_projects from JWT claims
+    if let Some(claims) = extract_jwt_claims(&headers) {
+        if let Some(allowed_projects_str) = claims
+            .get("custom:allowed_projects")
+            .and_then(|v| v.as_str())
+        {
+            let allowed_projects: Vec<String> = allowed_projects_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            if !allowed_projects.is_empty() {
+                log::info!(
+                    "Using allowed_projects from JWT claims for user {}: {:?}",
+                    user_id,
+                    allowed_projects
+                );
+                payload["allowed_projects"] = json!(allowed_projects);
+            }
+        }
+    }
 
     if let Some(limit) = query.limit {
         payload["limit"] = json!(limit);
@@ -841,20 +1078,30 @@ async fn deprecate_module(
 #[derive(Deserialize)]
 struct PublishModuleBody {
     zip_base64: String,
+    module: Value, // ModuleResp serialized as JSON
     track: String,
-    version: Option<String>,
-    job_id: String, // Client-provided UUID
+    version: String,
+    job_id: String,
+}
+
+async fn download_provider(Json(body): Json<Value>) -> impl IntoResponse {
+    handle_result(
+        handlers::download_provider(&json!({
+            "s3_key": body.get("s3_key")
+        }))
+        .await,
+    )
+    .await
 }
 
 async fn publish_module(Json(body): Json<PublishModuleBody>) -> impl IntoResponse {
     handle_result(
         handlers::publish_module(&json!({
-            "data": {
-                "zip_base64": body.zip_base64,
-                "track": body.track,
-                "version": body.version,
-                "job_id": body.job_id
-            }
+            "zip_base64": body.zip_base64,
+            "module": body.module,
+            "track": body.track,
+            "version": body.version,
+            "job_id": body.job_id
         }))
         .await,
     )
@@ -869,4 +1116,181 @@ async fn get_publish_job_status(Path(job_id): Path<String>) -> impl IntoResponse
         .await,
     )
     .await
+}
+
+async fn run_claim(Json(body): Json<Value>) -> impl IntoResponse {
+    log::info!("Received run_claim request");
+    // Body is ApiInfraPayloadWithVariables
+    // Manually extract payload and variables from the JSON value
+    let payload_value = match body.get("payload") {
+        Some(p) => p.clone(),
+        None => return handle_result(Err(anyhow::anyhow!("Missing 'payload' field"))).await,
+    };
+
+    let variables = match body.get("variables") {
+        Some(v) => v.clone(),
+        None => return handle_result(Err(anyhow::anyhow!("Missing 'variables' field"))).await,
+    };
+
+    let payload: env_defs::ApiInfraPayload = match serde_json::from_value(payload_value.clone()) {
+        Ok(p) => p,
+        Err(e) => return handle_result(Err(anyhow::anyhow!("Invalid payload: {}", e))).await,
+    };
+
+    // Launch runner with ApiInfraPayload only (no variables to avoid size limits)
+    let result = handlers::start_runner(&json!({
+        "data": payload_value
+    }))
+    .await;
+
+    let task_arn = match result {
+        Ok(resp) => resp["task_arn"].as_str().unwrap_or("").to_string(),
+        Err(e) => return handle_result(Err(e)).await,
+    };
+
+    // Extract task ID from ARN: arn:aws:ecs:region:account:task/cluster/TASK_ID
+    let task_id = task_arn.split('/').last().unwrap_or(&task_arn).to_string();
+
+    log::info!("Task ARN: {}, Task ID: {}", task_arn, task_id);
+
+    // Insert deployment record with variables into database using task ID
+    // This allows the runner to query the deployment and get variables
+    if let Err(e) = insert_deployment_record(&payload, &variables, &task_id).await {
+        log::error!("Failed to insert deployment record: {}", e);
+        return handle_result(Err(e)).await;
+    }
+
+    handle_result(Ok(json!({
+        "task_arn": task_arn,
+        "job_id": task_id
+    })))
+    .await
+}
+
+async fn insert_deployment_record(
+    payload: &env_defs::ApiInfraPayload,
+    variables: &serde_json::Value,
+    job_id: &str,
+) -> Result<(), anyhow::Error> {
+    use env_common::interface::GenericCloudHandler;
+
+    let handler = GenericCloudHandler::workload(&payload.project_id, &payload.region).await;
+
+    let payload_with_variables = env_defs::ApiInfraPayloadWithVariables {
+        payload: payload.clone(),
+        variables: variables.clone(),
+    };
+
+    env_common::insert_request_event(&handler, &payload_with_variables, job_id).await
+}
+
+async fn get_job_status_http(
+    Path((project, region, rest)): Path<(String, String, String)>,
+) -> impl IntoResponse {
+    let job_id = rest.trim_start_matches('/');
+    log::info!("get_job_status_http called for job: {}", job_id);
+
+    let payload = json!({
+        "data": {
+            "job_id": job_id,
+            "project": project,
+            "region": region
+        }
+    });
+
+    let result = handlers::get_job_status(&payload).await;
+    handle_result(result).await
+}
+
+// Token bridge handler - generates sign-in URL or exchanges code for tokens
+#[cfg(feature = "aws")]
+async fn get_token_for_iam_user(headers: HeaderMap, Json(body): Json<Value>) -> impl IntoResponse {
+    use crate::auth_handler;
+
+    // Check if this is a token exchange request (has authorization code)
+    if let Some(code) = body.get("code").and_then(|v| v.as_str()) {
+        // Token exchange flow: code -> tokens
+        let redirect_uri = body
+            .get("redirect_uri")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        match auth_handler::exchange_code_for_tokens(code, redirect_uri).await {
+            Ok(token_response) => return (StatusCode::OK, Json(token_response)).into_response(),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": format!("Failed to exchange code for tokens: {}", e)
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Sign-in URL flow: verify user exists and return sign-in URL
+    // Extract IAM identity from the request headers
+    // This is injected by the unified handler from API Gateway context
+    let user_id = if let Some(user) = headers.get("x-auth-user").and_then(|v| v.to_str().ok()) {
+        user.to_string()
+    } else if let Some(iam_context) = body.get("requestContext") {
+        // Fallback: try to extract from request context if passed in body
+        match auth_handler::extract_iam_identity(iam_context) {
+            Ok(identity) => identity,
+            Err(e) => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({
+                        "error": format!("Failed to extract IAM identity: {}", e)
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "Missing IAM authentication. This endpoint requires IAM authorization."
+            })),
+        )
+            .into_response();
+    };
+
+    // Get optional redirect_uri from request body
+    let redirect_uri = body
+        .get("redirect_uri")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    match auth_handler::generate_token_for_iam_user(&user_id, redirect_uri).await {
+        Ok(token_response) => (StatusCode::OK, Json(token_response)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": format!("Failed to generate token: {}", e)
+            })),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(not(feature = "aws"))]
+async fn get_token_for_iam_user(Json(_body): Json<Value>) -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": "Token bridge is only available for AWS deployments"
+        })),
+    )
+        .into_response()
+}
+
+async fn get_meta_info() -> impl IntoResponse {
+    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "unknown".to_string());
+    Json(json!({
+        "region": region,
+        "service": "infraweave-internal-api",
+        "version": env!("CARGO_PKG_VERSION")
+    }))
 }

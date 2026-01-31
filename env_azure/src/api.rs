@@ -505,6 +505,68 @@ pub fn get_plan_deployment_query(
     })
 }
 
+pub fn get_deployment_history_plans_query(
+    project_id: &str,
+    region: &str,
+    environment: Option<&str>,
+) -> Value {
+    let pk_prefix = if let Some(env) = environment {
+        format!(
+            "PLAN#{}",
+            get_deployment_identifier(project_id, region, "", env)
+        )
+    } else {
+        format!("PLAN#{}::{}", project_id, region)
+    };
+
+    json!({
+        "query": "SELECT * FROM c WHERE STARTSWITH(c.PK, @pk_prefix) AND c.deleted = @not_deleted ORDER BY c.epoch DESC",
+        "parameters": [
+            {
+                "name": "@pk_prefix",
+                "value": pk_prefix
+            },
+            {
+                "name": "@not_deleted",
+                "value": 0
+            }
+        ]
+    })
+}
+
+pub fn get_deployment_history_deleted_query(
+    project_id: &str,
+    region: &str,
+    environment: Option<&str>,
+) -> Value {
+    let pk_prefix = if let Some(env) = environment {
+        format!(
+            "DEPLOYMENT#{}",
+            get_deployment_identifier(project_id, region, "", env)
+        )
+    } else {
+        format!("DEPLOYMENT#{}::{}", project_id, region)
+    };
+
+    json!({
+        "query": "SELECT * FROM c WHERE STARTSWITH(c.PK, @pk_prefix) AND c.deleted = @deleted AND c.SK = @metadata ORDER BY c.epoch DESC",
+        "parameters": [
+            {
+                "name": "@pk_prefix",
+                "value": pk_prefix
+            },
+            {
+                "name": "@deleted",
+                "value": 1
+            },
+            {
+                "name": "@metadata",
+                "value": "METADATA"
+            }
+        ]
+    })
+}
+
 pub fn get_dependents_query(
     project_id: &str,
     region: &str,

@@ -77,7 +77,12 @@ pub struct AzureDatabase;
 
 #[cfg(feature = "azure")]
 impl DatabaseQuery for AzureDatabase {
-    async fn query_container(&self, container: &str, query: &Value) -> Result<Value> {
+    async fn query_container(
+        &self,
+        container: &str,
+        query: &Value,
+        _region: Option<&str>,
+    ) -> Result<Value> {
         let payload = json!({
             "table": container,
             "data": {

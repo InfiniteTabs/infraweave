@@ -1,9 +1,9 @@
 apiVersion: infraweave.io/v1
-kind: S3Bucket
+kind: S3BucketSimple
 metadata:
   name: bucket2
 spec:
-  moduleVersion: 0.1.3-dev+test.10
+  moduleVersion: 1.0.0
   region: N/A
   variables:
-    bucketName: "{{ S3Bucket::bucket1a::bucketName }}-after"
+    bucketName: "{{ S3BucketSimple::bucket1a::bucketName }}-after"

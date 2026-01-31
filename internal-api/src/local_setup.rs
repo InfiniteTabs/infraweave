@@ -88,12 +88,13 @@ pub async fn start_local_infrastructure() -> anyhow::Result<LocalInfra> {
     // Configure AWS auth/region for local
     std::env::set_var("AWS_ACCESS_KEY_ID", "minio");
     std::env::set_var("AWS_SECRET_ACCESS_KEY", "minio123");
-    std::env::set_var("AWS_REGION", "us-west-2");
+    // Only set default if not already present
+    // std::env::set_var("AWS_REGION", "us-west-2");
 
     // Set default business logic env vars if they are missing
-    if std::env::var("REGION").is_err() {
-        std::env::set_var("REGION", "us-west-2");
-    }
+    // if std::env::var("REGION").is_err() {
+    //    std::env::set_var("REGION", "us-west-2");
+    // }
     if std::env::var("CLOUD_PROVIDER").is_err() {
         std::env::set_var("CLOUD_PROVIDER", "aws");
     }
@@ -119,9 +120,13 @@ pub async fn start_local_infrastructure() -> anyhow::Result<LocalInfra> {
         std::env::set_var("CENTRAL_ACCOUNT_ID", "000000000000");
     }
     if std::env::var("NOTIFICATION_TOPIC_ARN").is_err() {
+        let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".to_string());
         std::env::set_var(
             "NOTIFICATION_TOPIC_ARN",
-            "arn:aws:sns:us-west-2:000000000000:infraweave-notifications",
+            format!(
+                "arn:aws:sns:{}:000000000000:infraweave-notifications",
+                region
+            ),
         );
     }
 
@@ -139,13 +144,14 @@ async fn bootstrap_resources() -> anyhow::Result<()> {
     // Get the DynamoDB endpoint we set earlier
     let dynamodb_endpoint = std::env::var("DYNAMODB_ENDPOINT")?;
 
+    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".to_string());
     // Create DynamoDB client with explicit endpoint configuration
     let dynamodb_creds =
         aws_sdk_dynamodb::config::Credentials::new("minio", "minio123", None, None, "static");
     let dynamodb_config = aws_sdk_dynamodb::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .endpoint_url(&dynamodb_endpoint)
-        .region(aws_sdk_dynamodb::config::Region::new("us-west-2"))
+        .region(aws_sdk_dynamodb::config::Region::new(region.clone()))
         .credentials_provider(dynamodb_creds)
         .build();
     let dynamodb = aws_sdk_dynamodb::Client::from_conf(dynamodb_config);
@@ -157,7 +163,7 @@ async fn bootstrap_resources() -> anyhow::Result<()> {
     let s3_config = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .endpoint_url(&minio_endpoint)
-        .region(aws_sdk_s3::config::Region::new("us-west-2"))
+        .region(aws_sdk_s3::config::Region::new(region.clone()))
         .credentials_provider(s3_creds)
         .force_path_style(true)
         .build();
@@ -176,25 +182,34 @@ async fn bootstrap_resources() -> anyhow::Result<()> {
         std::env::set_var(env_var, table_name);
         println!("Creating DynamoDB table: {}", table_name);
 
-        let mut create_table = dynamodb
-            .create_table()
-            .table_name(table_name.to_string())
-            .attribute_definitions(
-                AttributeDefinition::builder()
-                    .attribute_name("PK")
-                    .attribute_type(ScalarAttributeType::S)
-                    .build()?,
-            )
-            .key_schema(
-                KeySchemaElement::builder()
-                    .attribute_name("PK")
-                    .key_type(KeyType::Hash)
-                    .build()?,
-            )
-            .billing_mode(BillingMode::PayPerRequest);
+        let mut create_table = dynamodb.create_table().table_name(table_name.to_string());
 
-        if *table_name != "config" {
+        // Different tables have different schemas
+        if *table_name == "permissions" {
+            // Permissions table uses user_id as primary key
             create_table = create_table
+                .attribute_definitions(
+                    AttributeDefinition::builder()
+                        .attribute_name("user_id")
+                        .attribute_type(ScalarAttributeType::S)
+                        .build()?,
+                )
+                .key_schema(
+                    KeySchemaElement::builder()
+                        .attribute_name("user_id")
+                        .key_type(KeyType::Hash)
+                        .build()?,
+                )
+                .billing_mode(BillingMode::PayPerRequest);
+        } else {
+            // Most tables use PK/SK pattern, including config table
+            create_table = create_table
+                .attribute_definitions(
+                    AttributeDefinition::builder()
+                        .attribute_name("PK")
+                        .attribute_type(ScalarAttributeType::S)
+                        .build()?,
+                )
                 .attribute_definitions(
                     AttributeDefinition::builder()
                         .attribute_name("SK")
@@ -203,199 +218,198 @@ async fn bootstrap_resources() -> anyhow::Result<()> {
                 )
                 .key_schema(
                     KeySchemaElement::builder()
+                        .attribute_name("PK")
+                        .key_type(KeyType::Hash)
+                        .build()?,
+                )
+                .key_schema(
+                    KeySchemaElement::builder()
                         .attribute_name("SK")
                         .key_type(KeyType::Range)
                         .build()?,
-                );
-        }
+                )
+                .billing_mode(BillingMode::PayPerRequest);
 
-        if *table_name == "events" {
-            create_table = create_table
-                .attribute_definitions(
-                    AttributeDefinition::builder()
-                        .attribute_name("PK_base_region")
-                        .attribute_type(ScalarAttributeType::S)
-                        .build()?,
-                )
-                .global_secondary_indexes(
-                    GlobalSecondaryIndex::builder()
-                        .index_name("RegionIndex")
-                        .key_schema(
-                            KeySchemaElement::builder()
-                                .attribute_name("PK_base_region")
-                                .key_type(KeyType::Hash)
-                                .build()?,
-                        )
-                        .key_schema(
-                            KeySchemaElement::builder()
-                                .attribute_name("SK")
-                                .key_type(KeyType::Range)
-                                .build()?,
-                        )
-                        .projection(
-                            Projection::builder()
-                                .projection_type(ProjectionType::All)
-                                .build(),
-                        )
-                        .build()?,
-                );
-        } else if *table_name == "deployments" {
-            create_table = create_table
-                .attribute_definitions(
-                    AttributeDefinition::builder()
-                        .attribute_name("deleted_PK")
-                        .attribute_type(ScalarAttributeType::S)
-                        .build()?,
-                )
-                .attribute_definitions(
-                    AttributeDefinition::builder()
-                        .attribute_name("deleted_PK_base")
-                        .attribute_type(ScalarAttributeType::S)
-                        .build()?,
-                )
-                .attribute_definitions(
-                    AttributeDefinition::builder()
-                        .attribute_name("module")
-                        .attribute_type(ScalarAttributeType::S)
-                        .build()?,
-                )
-                .attribute_definitions(
-                    AttributeDefinition::builder()
-                        .attribute_name("module_PK_base")
-                        .attribute_type(ScalarAttributeType::S)
-                        .build()?,
-                )
-                .attribute_definitions(
-                    AttributeDefinition::builder()
-                        .attribute_name("deleted_SK_base")
-                        .attribute_type(ScalarAttributeType::S)
-                        .build()?,
-                )
-                .attribute_definitions(
-                    AttributeDefinition::builder()
-                        .attribute_name("next_drift_check_epoch")
-                        .attribute_type(ScalarAttributeType::N)
-                        .build()?,
-                )
-                .global_secondary_indexes(
-                    GlobalSecondaryIndex::builder()
-                        .index_name("DeletedIndex")
-                        .key_schema(
-                            KeySchemaElement::builder()
-                                .attribute_name("deleted_PK_base")
-                                .key_type(KeyType::Hash)
-                                .build()?,
-                        )
-                        .key_schema(
-                            KeySchemaElement::builder()
-                                .attribute_name("PK")
-                                .key_type(KeyType::Range)
-                                .build()?,
-                        )
-                        .projection(
-                            Projection::builder()
-                                .projection_type(ProjectionType::All)
-                                .build(),
-                        )
-                        .build()?,
-                )
-                .global_secondary_indexes(
-                    GlobalSecondaryIndex::builder()
-                        .index_name("ModuleIndex")
-                        .key_schema(
-                            KeySchemaElement::builder()
-                                .attribute_name("module_PK_base")
-                                .key_type(KeyType::Hash)
-                                .build()?,
-                        )
-                        .key_schema(
-                            KeySchemaElement::builder()
-                                .attribute_name("deleted_PK")
-                                .key_type(KeyType::Range)
-                                .build()?,
-                        )
-                        .projection(
-                            Projection::builder()
-                                .projection_type(ProjectionType::All)
-                                .build(),
-                        )
-                        .build()?,
-                )
-                .global_secondary_indexes(
-                    GlobalSecondaryIndex::builder()
-                        .index_name("GlobalModuleIndex")
-                        .key_schema(
-                            KeySchemaElement::builder()
-                                .attribute_name("module")
-                                .key_type(KeyType::Hash)
-                                .build()?,
-                        )
-                        .key_schema(
-                            KeySchemaElement::builder()
-                                .attribute_name("deleted_PK")
-                                .key_type(KeyType::Range)
-                                .build()?,
-                        )
-                        .projection(
-                            Projection::builder()
-                                .projection_type(ProjectionType::All)
-                                .build(),
-                        )
-                        .build()?,
-                )
-                .global_secondary_indexes(
-                    GlobalSecondaryIndex::builder()
-                        .index_name("DriftCheckIndex")
-                        .key_schema(
-                            KeySchemaElement::builder()
-                                .attribute_name("deleted_SK_base")
-                                .key_type(KeyType::Hash)
-                                .build()?,
-                        )
-                        .key_schema(
-                            KeySchemaElement::builder()
-                                .attribute_name("next_drift_check_epoch")
-                                .key_type(KeyType::Range)
-                                .build()?,
-                        )
-                        .projection(
-                            Projection::builder()
-                                .projection_type(ProjectionType::All)
-                                .build(),
-                        )
-                        .build()?,
-                )
-                .global_secondary_indexes(
-                    GlobalSecondaryIndex::builder()
-                        .index_name("ReverseIndex") // Add missing ReverseIndex
-                        .key_schema(
-                            KeySchemaElement::builder()
-                                .attribute_name("SK")
-                                .key_type(KeyType::Hash)
-                                .build()?,
-                        )
-                        .key_schema(
-                            KeySchemaElement::builder()
-                                .attribute_name("PK")
-                                .key_type(KeyType::Range)
-                                .build()?,
-                        )
-                        .projection(
-                            Projection::builder()
-                                .projection_type(ProjectionType::All)
-                                .build(),
-                        )
-                        .build()?,
-                );
-        } else if *table_name == "config" {
-            // Config only has PK
-            // The default generic block adds SK, which is fine, but for strictness we might want to avoid it?
-            // DynamoDB doesn't mind if you define KeySchema for SK but only Put items with PK?
-            // No, KeySchema MUST be present in Item.
-            // bootstrap.py ConfigTable: KeySchema=[PK only].
-
-            // So I need to conditionally add SK to KeySchema in logic above if I want to be perfectly aligned.
-        }
+            if *table_name == "events" {
+                create_table = create_table
+                    .attribute_definitions(
+                        AttributeDefinition::builder()
+                            .attribute_name("PK_base_region")
+                            .attribute_type(ScalarAttributeType::S)
+                            .build()?,
+                    )
+                    .global_secondary_indexes(
+                        GlobalSecondaryIndex::builder()
+                            .index_name("RegionIndex")
+                            .key_schema(
+                                KeySchemaElement::builder()
+                                    .attribute_name("PK_base_region")
+                                    .key_type(KeyType::Hash)
+                                    .build()?,
+                            )
+                            .key_schema(
+                                KeySchemaElement::builder()
+                                    .attribute_name("SK")
+                                    .key_type(KeyType::Range)
+                                    .build()?,
+                            )
+                            .projection(
+                                Projection::builder()
+                                    .projection_type(ProjectionType::All)
+                                    .build(),
+                            )
+                            .build()?,
+                    );
+            } else if *table_name == "deployments" {
+                create_table = create_table
+                    .attribute_definitions(
+                        AttributeDefinition::builder()
+                            .attribute_name("deleted_PK")
+                            .attribute_type(ScalarAttributeType::S)
+                            .build()?,
+                    )
+                    .attribute_definitions(
+                        AttributeDefinition::builder()
+                            .attribute_name("deleted_PK_base")
+                            .attribute_type(ScalarAttributeType::S)
+                            .build()?,
+                    )
+                    .attribute_definitions(
+                        AttributeDefinition::builder()
+                            .attribute_name("module")
+                            .attribute_type(ScalarAttributeType::S)
+                            .build()?,
+                    )
+                    .attribute_definitions(
+                        AttributeDefinition::builder()
+                            .attribute_name("module_PK_base")
+                            .attribute_type(ScalarAttributeType::S)
+                            .build()?,
+                    )
+                    .attribute_definitions(
+                        AttributeDefinition::builder()
+                            .attribute_name("deleted_SK_base")
+                            .attribute_type(ScalarAttributeType::S)
+                            .build()?,
+                    )
+                    .attribute_definitions(
+                        AttributeDefinition::builder()
+                            .attribute_name("next_drift_check_epoch")
+                            .attribute_type(ScalarAttributeType::N)
+                            .build()?,
+                    )
+                    .global_secondary_indexes(
+                        GlobalSecondaryIndex::builder()
+                            .index_name("DeletedIndex")
+                            .key_schema(
+                                KeySchemaElement::builder()
+                                    .attribute_name("deleted_PK_base")
+                                    .key_type(KeyType::Hash)
+                                    .build()?,
+                            )
+                            .key_schema(
+                                KeySchemaElement::builder()
+                                    .attribute_name("PK")
+                                    .key_type(KeyType::Range)
+                                    .build()?,
+                            )
+                            .projection(
+                                Projection::builder()
+                                    .projection_type(ProjectionType::All)
+                                    .build(),
+                            )
+                            .build()?,
+                    )
+                    .global_secondary_indexes(
+                        GlobalSecondaryIndex::builder()
+                            .index_name("ModuleIndex")
+                            .key_schema(
+                                KeySchemaElement::builder()
+                                    .attribute_name("module_PK_base")
+                                    .key_type(KeyType::Hash)
+                                    .build()?,
+                            )
+                            .key_schema(
+                                KeySchemaElement::builder()
+                                    .attribute_name("deleted_PK")
+                                    .key_type(KeyType::Range)
+                                    .build()?,
+                            )
+                            .projection(
+                                Projection::builder()
+                                    .projection_type(ProjectionType::All)
+                                    .build(),
+                            )
+                            .build()?,
+                    )
+                    .global_secondary_indexes(
+                        GlobalSecondaryIndex::builder()
+                            .index_name("GlobalModuleIndex")
+                            .key_schema(
+                                KeySchemaElement::builder()
+                                    .attribute_name("module")
+                                    .key_type(KeyType::Hash)
+                                    .build()?,
+                            )
+                            .key_schema(
+                                KeySchemaElement::builder()
+                                    .attribute_name("deleted_PK")
+                                    .key_type(KeyType::Range)
+                                    .build()?,
+                            )
+                            .projection(
+                                Projection::builder()
+                                    .projection_type(ProjectionType::All)
+                                    .build(),
+                            )
+                            .build()?,
+                    )
+                    .global_secondary_indexes(
+                        GlobalSecondaryIndex::builder()
+                            .index_name("DriftCheckIndex")
+                            .key_schema(
+                                KeySchemaElement::builder()
+                                    .attribute_name("deleted_SK_base")
+                                    .key_type(KeyType::Hash)
+                                    .build()?,
+                            )
+                            .key_schema(
+                                KeySchemaElement::builder()
+                                    .attribute_name("next_drift_check_epoch")
+                                    .key_type(KeyType::Range)
+                                    .build()?,
+                            )
+                            .projection(
+                                Projection::builder()
+                                    .projection_type(ProjectionType::All)
+                                    .build(),
+                            )
+                            .build()?,
+                    )
+                    .global_secondary_indexes(
+                        GlobalSecondaryIndex::builder()
+                            .index_name("ReverseIndex") // Add missing ReverseIndex
+                            .key_schema(
+                                KeySchemaElement::builder()
+                                    .attribute_name("SK")
+                                    .key_type(KeyType::Hash)
+                                    .build()?,
+                            )
+                            .key_schema(
+                                KeySchemaElement::builder()
+                                    .attribute_name("PK")
+                                    .key_type(KeyType::Range)
+                                    .build()?,
+                            )
+                            .projection(
+                                Projection::builder()
+                                    .projection_type(ProjectionType::All)
+                                    .build(),
+                            )
+                            .build()?,
+                    );
+            }
+        } // End of else block for non-permissions tables
 
         match create_table.send().await {
             Ok(_) => println!("Table {} created", table_name),
@@ -412,11 +426,12 @@ async fn bootstrap_resources() -> anyhow::Result<()> {
 
     // Seed Config Table
     // bootstrap.py puts: PK="all_regions", data={"regions": ["us-west-2"]}
+    // With SK support now
     let config_table_name = table_map.get("DYNAMODB_CONFIG_TABLE_NAME").unwrap();
     println!("Seeding Config Table: {}", config_table_name);
 
     let regions_val = aws_sdk_dynamodb::types::AttributeValue::L(vec![
-        aws_sdk_dynamodb::types::AttributeValue::S("us-west-2".to_string()),
+        aws_sdk_dynamodb::types::AttributeValue::S(region.clone()),
     ]);
     let data_map = aws_sdk_dynamodb::types::AttributeValue::M(std::collections::HashMap::from([(
         "regions".to_string(),
@@ -430,12 +445,106 @@ async fn bootstrap_resources() -> anyhow::Result<()> {
             "PK",
             aws_sdk_dynamodb::types::AttributeValue::S("all_regions".to_string()),
         )
+        .item(
+            "SK",
+            aws_sdk_dynamodb::types::AttributeValue::S("config".to_string()),
+        )
         .item("data", data_map)
         .send()
         .await
     {
         Ok(_) => println!("Seeded Config for all_regions"),
         Err(e) => println!("Error seeding config: {}", e),
+    }
+
+    // Seed sample projects to config table (now with SK)
+    let config_table_name = table_map.get("DYNAMODB_CONFIG_TABLE_NAME").unwrap();
+    println!("Seeding sample projects in table: {}", config_table_name);
+
+    let sample_projects = vec![
+        (
+            "project-alpha",
+            "Alpha Project",
+            "Development project for testing",
+        ),
+        (
+            "project-beta",
+            "Beta Project",
+            "Staging environment project",
+        ),
+        ("project-gamma", "Gamma Project", "Production workloads"),
+    ];
+
+    for (project_id, name, description) in sample_projects {
+        let regions_list = vec![aws_sdk_dynamodb::types::AttributeValue::S(region.clone())];
+
+        match dynamodb
+            .put_item()
+            .table_name(config_table_name.to_string())
+            .item(
+                "PK",
+                aws_sdk_dynamodb::types::AttributeValue::S("PROJECTS".to_string()),
+            )
+            .item(
+                "SK",
+                aws_sdk_dynamodb::types::AttributeValue::S(format!("PROJECT#{}", project_id)),
+            )
+            .item(
+                "project_id",
+                aws_sdk_dynamodb::types::AttributeValue::S(project_id.to_string()),
+            )
+            .item(
+                "name",
+                aws_sdk_dynamodb::types::AttributeValue::S(name.to_string()),
+            )
+            .item(
+                "description",
+                aws_sdk_dynamodb::types::AttributeValue::S(description.to_string()),
+            )
+            .item(
+                "regions",
+                aws_sdk_dynamodb::types::AttributeValue::L(regions_list),
+            )
+            .item(
+                "repositories",
+                aws_sdk_dynamodb::types::AttributeValue::L(vec![]),
+            )
+            .send()
+            .await
+        {
+            Ok(_) => println!("Seeded project: {}", project_id),
+            Err(e) => println!("Error seeding project {}: {}", project_id, e),
+        }
+    }
+
+    // Seed permissions table - grant local-user access to 2 out of 3 projects
+    let permissions_table_name = table_map.get("DYNAMODB_PERMISSIONS_TABLE_NAME").unwrap();
+    println!("Seeding permissions table: {}", permissions_table_name);
+
+    let allowed_projects = vec![
+        aws_sdk_dynamodb::types::AttributeValue::S("project-alpha".to_string()),
+        aws_sdk_dynamodb::types::AttributeValue::S("project-beta".to_string()),
+        // project-gamma is intentionally omitted to test access control
+    ];
+
+    match dynamodb
+        .put_item()
+        .table_name(permissions_table_name.to_string())
+        .item(
+            "user_id",
+            aws_sdk_dynamodb::types::AttributeValue::S("local-user".to_string()),
+        )
+        .item(
+            "allowed_projects",
+            aws_sdk_dynamodb::types::AttributeValue::L(allowed_projects),
+        )
+        .send()
+        .await
+    {
+        Ok(_) => {
+            println!("Seeded permissions for local-user (access to project-alpha and project-beta)")
+        }
+        Err(e) => println!("Error seeding permissions: {}", e),
     }
 
     // Buckets - use centralized configuration from env_aws

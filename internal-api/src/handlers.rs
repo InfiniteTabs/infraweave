@@ -3,13 +3,14 @@ use crate::get_param;
 use crate::queries::*;
 use anyhow::{anyhow, Result};
 use axum::response::{IntoResponse, Response};
+use env_defs::CloudProvider;
 use log::info;
 use serde_json::{json, Value};
 
 #[cfg(feature = "aws")]
 use crate::aws_handlers::{
-    download_file, download_file_as_string, get_bucket_name, get_user_allowed_projects,
-    AwsDatabase as Database,
+    download_file, download_file_as_string, download_file_as_string_from_region, get_bucket_name,
+    get_bucket_name_for_region, AwsDatabase as Database,
 };
 
 #[cfg(feature = "azure")]
@@ -20,6 +21,10 @@ use crate::azure_handlers::{
 pub async fn describe_deployment(payload: &Value) -> Result<Value> {
     api_common::describe_deployment_impl(&Database, payload, get_deployment_and_dependents_query)
         .await
+}
+
+pub async fn describe_plan_deployment(payload: &Value) -> Result<Value> {
+    api_common::get_plan_deployment_impl(&Database, payload, get_plan_deployment_query).await
 }
 
 pub async fn get_deployments(payload: &Value) -> Result<Value> {
@@ -35,23 +40,38 @@ pub async fn get_projects(payload: &Value) -> Result<Value> {
         api_common::get_projects_impl(&Database, payload, get_all_projects_query).await?;
 
     // Filter projects based on user access
-    if let Some(user_id) = payload.get("user_id").and_then(|v| v.as_str()) {
-        info!("Filtering projects for user_id: {}", user_id);
-        // Fetch allowed projects from DB once
-        let allowed_projects = get_user_allowed_projects(user_id).await?;
+    let allowed_projects =
+        if let Some(allowed) = payload.get("allowed_projects").and_then(|v| v.as_array()) {
+            // Projects from JWT claims (preferred method)
+            info!("Using allowed_projects from JWT claims");
+            allowed
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<String>>()
+        } else if payload.get("user_id").is_some() {
+            // If user is authenticated but has no allowed_projects claim, they get access to nothing
+            // This enforces the JWT as the source of truth
+            log::warn!(
+            "User authenticated but no allowed_projects claim found - denying access to projects"
+        );
+            Vec::new()
+        } else {
+            // No filtering - return all projects (when no auth)
+            info!("No user authentication provided - returning all projects");
+            return Ok(result);
+        };
 
-        if let Some(items) = result.get_mut("Items").and_then(|i| i.as_array_mut()) {
-            // Filter the items efficiently
-            items.retain(|item| {
-                let project_id = item
-                    .get("project")
-                    .or_else(|| item.get("project_id"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
+    if let Some(items) = result.get_mut("Items").and_then(|i| i.as_array_mut()) {
+        // Filter the items efficiently
+        items.retain(|item| {
+            let project_id = item
+                .get("project")
+                .or_else(|| item.get("project_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
 
-                allowed_projects.contains(&project_id.to_string())
-            });
-        }
+            allowed_projects.contains(&project_id.to_string())
+        });
     }
 
     Ok(result)
@@ -90,7 +110,15 @@ pub async fn get_module_download_url(payload: &Value) -> Result<Response> {
     #[cfg(feature = "azure")]
     let bucket = get_env_var("MODULE_S3_BUCKET")?;
 
-    download_file(&bucket, s3_key).await
+    log::info!(
+        "Downloading module from bucket: {}, key: {}",
+        bucket,
+        s3_key
+    );
+    download_file(&bucket, s3_key).await.map_err(|e| {
+        log::error!("Failed to download module {}: {:?}", s3_key, e);
+        e
+    })
 }
 
 pub async fn get_provider_version(payload: &Value) -> Result<Value> {
@@ -106,12 +134,21 @@ pub async fn get_provider_download_url(payload: &Value) -> Result<Response> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Provider has no s3_key"))?;
 
+    // Providers are stored in the modules bucket
     #[cfg(feature = "aws")]
-    let bucket = get_bucket_name("providers")?;
+    let bucket = get_bucket_name("modules")?;
     #[cfg(feature = "azure")]
-    let bucket = get_env_var("PROVIDERS_S3_BUCKET")?;
+    let bucket = get_env_var("MODULE_S3_BUCKET")?;
 
-    download_file(&bucket, s3_key).await
+    log::info!(
+        "Downloading provider from bucket: {}, key: {}",
+        bucket,
+        s3_key
+    );
+    download_file(&bucket, s3_key).await.map_err(|e| {
+        log::error!("Failed to download provider {}: {:?}", s3_key, e);
+        e
+    })
 }
 
 pub async fn get_stack_version(payload: &Value) -> Result<Value> {
@@ -161,6 +198,16 @@ pub async fn get_change_record(payload: &Value) -> Result<Value> {
     api_common::get_change_record_impl(&Database, payload, get_change_records_query).await
 }
 
+pub async fn get_deployment_history(payload: &Value) -> Result<Value> {
+    api_common::get_deployment_history_impl(
+        &Database,
+        payload,
+        get_deployment_history_plans_query,
+        get_deployment_history_deleted_query,
+    )
+    .await
+}
+
 pub async fn get_change_record_graph(payload: &Value) -> Result<Response> {
     info!("get_change_record_graph payload: {:?}", payload);
     let change_record = match api_common::get_change_record_impl(
@@ -182,10 +229,25 @@ pub async fn get_change_record_graph(payload: &Value) -> Result<Response> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Change record has no plan_raw_json_key"))?;
 
-    let graph_key = plan_key.replace("_mutate_output.json", "_graph.dot");
+    // Generate graph key based on the plan key format
+    // For MUTATE: xxx_mutate_output.json -> xxx_graph.dot
+    // For PLAN: xxx_plan_output.json -> xxx_graph.dot
+    let graph_key = if plan_key.contains("_mutate_output.json") {
+        plan_key.replace("_mutate_output.json", "_graph.dot")
+    } else if plan_key.contains("_plan_output.json") {
+        plan_key.replace("_plan_output.json", "_graph.dot")
+    } else {
+        return Err(anyhow!("Unknown plan key format: {}", plan_key));
+    };
+
+    // Get region from payload to use correct S3 bucket
+    let region = payload
+        .get("region")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing region in payload"))?;
 
     #[cfg(feature = "aws")]
-    let container_name = get_bucket_name("change_records")?;
+    let container_name = get_bucket_name_for_region("change_records", region)?;
     #[cfg(feature = "azure")]
     let container_name = get_env_var("CHANGE_RECORD_S3_BUCKET")?;
 
@@ -193,14 +255,16 @@ pub async fn get_change_record_graph(payload: &Value) -> Result<Response> {
         "Fetching plan from container: {}, key: {}",
         container_name, plan_key
     );
-    let plan_content = download_file_as_string(&container_name, plan_key).await?;
+    let plan_content =
+        download_file_as_string_from_region(&container_name, plan_key, Some(region)).await?;
     info!("Plan content length: {}", plan_content.len());
 
     info!(
         "Fetching graph from container: {}, key: {}",
         container_name, graph_key
     );
-    let graph_content = download_file_as_string(&container_name, &graph_key).await?;
+    let graph_content =
+        download_file_as_string_from_region(&container_name, &graph_key, Some(region)).await?;
     info!("Graph content length: {}", graph_content.len());
     info!("Graph content preview: {:.500}", graph_content);
 
@@ -243,7 +307,7 @@ pub async fn get_deployment_graph(payload: &Value) -> Result<Response> {
     );
 
     let cr_resp = Database
-        .query_container("change_records", &cr_query)
+        .query_container("change_records", &cr_query, None)
         .await?;
     let change_record = cr_resp
         .get("Items")
@@ -300,13 +364,22 @@ pub async fn deprecate_module(payload: &Value) -> Result<Value> {
 
     // Create a GenericCloudHandler for AWS
     let handler = GenericCloudHandler::default().await;
+    let all_regions = handler.get_all_regions().await?;
 
-    // Call the deprecate_module logic
-    deprecate_module_impl(&handler, module, track, version, message).await?;
+    // Deprecate module in all regions
+    for region in all_regions.iter() {
+        let region_handler = handler.copy_with_region(region).await;
+        deprecate_module_impl(&region_handler, module, track, version, message)
+            .await
+            .map_err(|e| anyhow!("Failed to deprecate module in region {}: {}", region, e))?;
+        info!("Module deprecated in region {}", region);
+    }
+
+    info!("Module deprecated successfully in all regions");
 
     Ok(json!({
         "success": true,
-        "message": format!("Module {} version {} in track {} has been deprecated", module, version, track)
+        "message": format!("Module {} version {} in track {} has been deprecated in all regions", module, version, track)
     }))
 }
 
@@ -315,9 +388,9 @@ pub async fn deprecate_module(payload: &Value) -> Result<Value> {
 // Specialized handlers
 #[cfg(feature = "aws")]
 pub use crate::aws_handlers::{
-    check_project_access, generate_presigned_url, get_environment_variables, get_job_status,
-    get_publish_job_status, insert_db, publish_module, publish_notification, read_db, read_logs,
-    start_runner, transact_write, upload_file_base64, upload_file_url,
+    check_project_access, download_provider, generate_presigned_url, get_environment_variables,
+    get_job_status, get_publish_job_status, insert_db, publish_module, publish_notification,
+    read_db, read_logs, start_runner, transact_write, upload_file_base64, upload_file_url,
 };
 
 #[cfg(feature = "azure")]
