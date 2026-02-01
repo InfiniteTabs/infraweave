@@ -3,8 +3,7 @@ use base64::engine::general_purpose::STANDARD as base64;
 use base64::Engine;
 use env_defs::{
     get_module_identifier, CloudProvider, DeploymentManifest, DeploymentMetadata, DeploymentSpec,
-    ModuleManifest, ModuleResp, ModuleVersionDiff, OciArtifactSet, ProviderResp, TfLockProvider,
-    TfVariable,
+    ModuleManifest, ModuleResp, OciArtifactSet, ProviderResp, TfLockProvider, TfVariable,
 };
 use env_utils::{
     convert_module_example_variables_to_camel_case, copy_dir_recursive,
@@ -50,7 +49,7 @@ pub async fn publish_module(
     if http_mode {
         info!("HTTP mode enabled, building module locally before upload");
     }
-    
+
     // Build logic (works for both HTTP and non-HTTP modes)
     let module_yaml_path = Path::new(manifest_path).join("module.yaml");
     let manifest =
@@ -118,7 +117,7 @@ pub async fn publish_module(
         } else {
             download_to_vec_from_modules(handler, &provider.s3_key).await
         };
-        
+
         let tf_content_provider = read_tf_from_zip(&provider_zip).unwrap();
 
         hcl::parse(&tf_content_provider)
@@ -399,7 +398,7 @@ pub async fn publish_module_from_zip(
         manifest_version.build
     );
 
-    let latest_version: Option<ModuleResp> =
+    let _latest_version: Option<ModuleResp> =
         match compare_latest_version(handler, &module, &version, track, ModuleType::Module).await {
             Ok(existing_version) => existing_version, // Returns existing module if newer, otherwise it's the first module version to be published
             Err(error) => {
@@ -415,48 +414,8 @@ pub async fn publish_module_from_zip(
         )));
     }
 
-    let version_diff = match latest_version {
-        // TODO break out to function
-        Some(previous_existing_module) => {
-            // Skip version comparison in HTTP mode since it requires downloading the previous version
-            // which needs presigned URLs not currently available via HTTP API
-            if env_aws::is_http_mode_enabled() {
-                info!("Skipping version comparison in HTTP mode");
-                None
-            } else {
-                let current_version_module_hcl_str = &tf_content;
-
-                // Download the previous version of the module and get hcl content
-                let previous_version_s3_key = &previous_existing_module.s3_key;
-                let previous_version_module_zip =
-                    download_to_vec_from_modules(handler, previous_version_s3_key).await;
-
-                // Extract all hcl blocks from the zip file
-                let previous_version_module_hcl_str =
-                    match env_utils::read_tf_from_zip(&previous_version_module_zip) {
-                        Ok(hcl_str) => hcl_str,
-                        Err(error) => {
-                            println!("{}", error);
-                            std::process::exit(1);
-                        }
-                    };
-
-                // Compare with existing hcl blocks in current version
-                let (additions, changes, deletions) = env_utils::diff_modules(
-                    &previous_version_module_hcl_str,
-                    current_version_module_hcl_str,
-                );
-
-                Some(ModuleVersionDiff {
-                    added: additions,
-                    changed: changes,
-                    removed: deletions,
-                    previous_version: previous_existing_module.version.clone(),
-                })
-            }
-        }
-        _ => None,
-    };
+    // Version diff feature has been deprecated - always set to None for backward compatibility
+    let version_diff = None;
 
     let tf_lock_providers: Vec<TfLockProvider> =
         get_providers_from_lockfile(&get_terraform_lockfile(&zip_file).unwrap()).unwrap();
@@ -498,14 +457,14 @@ pub async fn publish_module_from_zip(
     // HTTP API mode: send built module to server for upload/storage only
     if env_aws::is_http_mode_enabled() {
         info!("HTTP mode: Sending built module to API for upload and storage");
-        
+
         // Serialize the module metadata to send along with the zip
         let module_json = serde_json::to_value(&module)
             .map_err(|e| ModuleError::PublishError(format!("Failed to serialize module: {}", e)))?;
-        
+
         // Generate a job ID
         let job_id = uuid::Uuid::new_v4().to_string();
-        
+
         // Send to server with module metadata
         let payload = serde_json::json!({
             "zip_base64": zip_base64,
@@ -514,10 +473,11 @@ pub async fn publish_module_from_zip(
             "version": version,
             "job_id": job_id
         });
-        
-        env_aws::http_post("/api/v1/module/publish", &payload).await
+
+        env_aws::http_post("/api/v1/module/publish", &payload)
+            .await
             .map_err(|e| ModuleError::PublishError(format!("Failed to upload module: {}", e)))?;
-        
+
         info!("Module uploaded successfully via HTTP API");
         return Ok(());
     }
@@ -1048,8 +1008,12 @@ pub async fn download_to_vec_from_modules(
         match handler.run_function(&payload).await {
             Ok(response) => {
                 // Response contains base64-encoded file content
-                if let Some(content_str) = response.payload.get("content").and_then(|v| v.as_str()) {
-                    match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, content_str) {
+                if let Some(content_str) = response.payload.get("content").and_then(|v| v.as_str())
+                {
+                    match base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        content_str,
+                    ) {
                         Ok(bytes) => {
                             info!("Downloaded module directly from S3");
                             bytes
