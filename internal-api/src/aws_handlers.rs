@@ -18,6 +18,10 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 #[cfg(feature = "aws")]
 use tokio_util::io::ReaderStream;
+#[cfg(feature = "aws")]
+use tracing::{instrument, event, Level};
+#[cfg(feature = "aws")]
+use aws_smithy_runtime_api::client::behavior_version::BehaviorVersion;
 
 #[cfg(feature = "aws")]
 use crate::common::get_env_var;
@@ -197,6 +201,7 @@ impl DatabaseQuery for AwsDatabase {
 }
 
 #[cfg(feature = "aws")]
+#[instrument(skip(payload), fields(table = tracing::field::Empty, items = tracing::field::Empty))]
 pub async fn insert_db(payload: &Value) -> Result<Value> {
     let table = get_param!(payload, "table");
     let data = payload
@@ -206,6 +211,10 @@ pub async fn insert_db(payload: &Value) -> Result<Value> {
     let region = payload.get("region").and_then(|v| v.as_str());
 
     let table_name = get_table_name(table, region)?;
+    
+    // Record table name in span
+    tracing::Span::current().record("table", &table_name.as_str());
+    
     let client = dynamodb_client(region).await;
     let item = json_to_dynamodb_item(data)?;
 
@@ -216,6 +225,8 @@ pub async fn insert_db(payload: &Value) -> Result<Value> {
         .send()
         .await?;
 
+    event!(Level::INFO, "DynamoDB put_item completed");
+
     Ok(json!({
         "ResponseMetadata": {
             "HTTPStatusCode": 200,
@@ -225,11 +236,14 @@ pub async fn insert_db(payload: &Value) -> Result<Value> {
 }
 
 #[cfg(feature = "aws")]
+#[instrument(skip(payload), fields(operations = tracing::field::Empty))]
 pub async fn transact_write(payload: &Value) -> Result<Value> {
     let operations = payload
         .get("items")
         .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow!("Missing 'items' array"))?;
+
+    tracing::Span::current().record("operations", operations.len());
 
     let region = payload.get("region").and_then(|v| v.as_str());
 
@@ -303,6 +317,7 @@ pub async fn transact_write(payload: &Value) -> Result<Value> {
 }
 
 #[cfg(feature = "aws")]
+#[instrument(skip(payload), fields(table, query_type, items_returned, capacity_units))]
 pub async fn read_db(payload: &Value) -> Result<Value> {
     let start_time = std::time::Instant::now();
     let table = get_param!(payload, "table");
@@ -314,6 +329,9 @@ pub async fn read_db(payload: &Value) -> Result<Value> {
     let region = payload.get("region").and_then(|v| v.as_str());
 
     let table_name = get_table_name(table, region)?;
+    let span = tracing::Span::current();
+    span.record("table", &table_name.as_str());
+    
     info!("Querying table '{}' in region '{:?}'", table_name, region);
 
     let client = dynamodb_client(region).await;
@@ -324,6 +342,7 @@ pub async fn read_db(payload: &Value) -> Result<Value> {
 
     if has_key_condition {
         // Use Query operation
+        span.record("query_type", "query");
         let mut query_builder = client.query().table_name(table_name);
 
         if let Some(key_condition) = query_data.get("KeyConditionExpression") {
@@ -425,6 +444,7 @@ pub async fn read_db(payload: &Value) -> Result<Value> {
         }
 
         let elapsed = start_time.elapsed();
+        event!(Level::INFO, duration_ms = elapsed.as_millis() as f64, "DynamoDB query completed");
         info!(
             "DB query to table '{}' completed in {:.2}ms. Query: {}",
             table,
@@ -435,6 +455,7 @@ pub async fn read_db(payload: &Value) -> Result<Value> {
         Ok(response)
     } else {
         // Use Scan operation
+        span.record("query_type", "scan");
         let mut scan_builder = client.scan().table_name(table_name);
 
         if let Some(filter_expr) = query_data.get("FilterExpression") {
@@ -494,6 +515,13 @@ pub async fn read_db(payload: &Value) -> Result<Value> {
             .map(|item| from_item(item.clone()))
             .collect::<Result<Vec<_>, _>>()?;
 
+        span.record("items_returned", items.len());
+        if let Some(consumed_capacity) = result.consumed_capacity() {
+            if let Some(units) = consumed_capacity.capacity_units() {
+                span.record("capacity_units", units);
+            }
+        }
+
         let mut response = json!({
             "Items": items,
             "Count": result.count(),
@@ -518,6 +546,7 @@ pub async fn read_db(payload: &Value) -> Result<Value> {
         }
 
         let elapsed = start_time.elapsed();
+        event!(Level::INFO, duration_ms = elapsed.as_millis() as f64, "DynamoDB scan completed");
         info!(
             "DB scan to table '{}' completed in {:.2}ms. Query: {}",
             table,
@@ -530,6 +559,7 @@ pub async fn read_db(payload: &Value) -> Result<Value> {
 }
 
 #[cfg(feature = "aws")]
+#[instrument(skip(payload), fields(bucket, key, file_size_bytes))]
 pub async fn upload_file_base64(payload: &Value) -> Result<Value> {
     let data = payload
         .get("data")
@@ -551,11 +581,17 @@ pub async fn upload_file_base64(payload: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("Missing 'base64_content' parameter"))?;
 
     let bucket_name = get_bucket_name(bucket_key)?;
+    
+    let span = tracing::Span::current();
+    span.record("bucket", &bucket_name.as_str());
+    span.record("key", &key);
 
     let content = general_purpose::STANDARD
         .decode(content_base64)
         .map_err(|e| anyhow!("Failed to decode base64: {}", e))?;
 
+    span.record("file_size_bytes", content.len());
+    
     let client = s3_client(region).await;
 
     client
@@ -566,6 +602,8 @@ pub async fn upload_file_base64(payload: &Value) -> Result<Value> {
         .send()
         .await?;
 
+    event!(Level::INFO, "S3 upload from base64 completed");
+
     Ok(json!({
         "statusCode": 200,
         "body": "File uploaded successfully"
@@ -573,6 +611,7 @@ pub async fn upload_file_base64(payload: &Value) -> Result<Value> {
 }
 
 #[cfg(feature = "aws")]
+#[instrument(skip(payload), fields(bucket, key, source_url, file_size_bytes, already_exists))]
 pub async fn upload_file_url(payload: &Value) -> Result<Value> {
     let data = payload
         .get("data")
@@ -594,6 +633,11 @@ pub async fn upload_file_url(payload: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("Missing 'url' parameter"))?;
 
     let bucket_name = get_bucket_name(bucket_key)?;
+    
+    let span = tracing::Span::current();
+    span.record("bucket", &bucket_name.as_str());
+    span.record("key", &key);
+    span.record("source_url", &url);
 
     let client = s3_client(region).await;
 
@@ -605,13 +649,19 @@ pub async fn upload_file_url(payload: &Value) -> Result<Value> {
         .await
     {
         Ok(_) => {
+            span.record("already_exists", true);
+            event!(Level::INFO, "S3 object already exists, skipping upload");
             return Ok(json!({"object_already_exists": true}));
         }
-        Err(_) => {}
+        Err(_) => {
+            span.record("already_exists", false);
+        }
     }
 
     let response = reqwest::get(url).await?;
     let bytes = response.bytes().await?;
+    
+    span.record("file_size_bytes", bytes.len());
 
     client
         .put_object()
@@ -621,10 +671,13 @@ pub async fn upload_file_url(payload: &Value) -> Result<Value> {
         .send()
         .await?;
 
+    event!(Level::INFO, "S3 upload from URL completed");
+
     Ok(json!({"object_already_exists": false}))
 }
 
 #[cfg(feature = "aws")]
+#[instrument(skip(payload), fields(bucket, key, expires_in))]
 pub async fn generate_presigned_url(payload: &Value) -> Result<Value> {
     let data = payload
         .get("data")
@@ -643,6 +696,11 @@ pub async fn generate_presigned_url(payload: &Value) -> Result<Value> {
         .unwrap_or(3600);
 
     let bucket_name = get_bucket_name(bucket_key)?;
+    
+    let span = tracing::Span::current();
+    span.record("bucket", &bucket_name.as_str());
+    span.record("key", &key);
+    span.record("expires_in", expires_in);
     let client = s3_client(region).await;
     let presigning_config = aws_sdk_s3::presigning::PresigningConfig::expires_in(
         std::time::Duration::from_secs(expires_in as u64),
@@ -655,12 +713,15 @@ pub async fn generate_presigned_url(payload: &Value) -> Result<Value> {
         .presigned(presigning_config)
         .await?;
 
+    event!(Level::INFO, "Presigned URL generated successfully");
+
     Ok(json!({
         "url": presigned_request.uri()
     }))
 }
 
 #[cfg(feature = "aws")]
+#[instrument(skip(payload), fields(project_id, environment, region, task_definition))]
 pub async fn start_runner(payload: &Value) -> Result<Value> {
     log::info!(
         "start_runner called with payload keys: {:?}",
@@ -675,10 +736,14 @@ pub async fn start_runner(payload: &Value) -> Result<Value> {
         .get("project_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Missing 'project_id' in payload"))?;
+    
+    let span = tracing::Span::current();
+    span.record("project_id", &project_id);
 
     let environment = get_env_var("ENVIRONMENT")?;
+    span.record("environment", &environment.as_str());
 
-    let region = if let Ok(r) = get_env_var("REGION") {
+    let _central_region = if let Ok(r) = get_env_var("REGION") {
         if r != "us-west-2" || environment != "dev" {
             r
         } else {
@@ -716,11 +781,13 @@ pub async fn start_runner(payload: &Value) -> Result<Value> {
 
     // We use the payload region for setting up the clients because that's where the workload resources are
     let region = payload_region;
+    span.record("region", &region);
 
     let cpu = data.get("cpu").and_then(|v| v.as_str()).unwrap_or("256");
     let memory = data.get("memory").and_then(|v| v.as_str()).unwrap_or("512");
 
     // Always assume role into the workload account to launch ECS task
+    event!(Level::INFO, "Assuming role in workload account for ECS task launch");
     log::info!(
         "Assuming role in workload account {} to launch ECS task",
         project_id
@@ -851,6 +918,7 @@ pub async fn start_runner(payload: &Value) -> Result<Value> {
 
     // Use standard task definition naming
     let task_definition = format!("infraweave-runner-{}", environment);
+    span.record("task_definition", &task_definition.as_str());
 
     log::info!(
         "Retrieved config - cluster: {}, task_definition: {}, subnets: {:?}, security_groups: {:?}",
@@ -859,6 +927,8 @@ pub async fn start_runner(payload: &Value) -> Result<Value> {
         subnets,
         security_groups
     );
+
+    event!(Level::INFO, cluster = %cluster, subnets = subnets.len(), "ECS configuration retrieved from SSM");
 
     // Pass ApiInfraPayload as PAYLOAD env var (no variables to avoid size limits)
     // Variables are stored in database and retrieved by runner
@@ -933,15 +1003,19 @@ pub async fn start_runner(payload: &Value) -> Result<Value> {
         .and_then(|t| t.task_arn())
         .ok_or_else(|| anyhow!("No task ARN returned"))?;
 
+    let job_id = task_arn.split('/').last().unwrap_or(task_arn);
+    
+    event!(Level::INFO, task_arn = %task_arn, job_id = %job_id, "ECS task launched successfully");
     log::info!("Successfully launched ECS task: {}", task_arn);
 
     Ok(json!({
         "task_arn": task_arn,
-        "job_id": task_arn.split('/').last().unwrap_or(task_arn)
+        "job_id": job_id
     }))
 }
 
 #[cfg(feature = "aws")]
+#[instrument(skip(payload), fields(job_id, project_id, region, task_status))]
 pub async fn get_job_status(payload: &Value) -> Result<Value> {
     let data = payload
         .get("data")
@@ -960,6 +1034,11 @@ pub async fn get_job_status(payload: &Value) -> Result<Value> {
         .get("region")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Missing 'region' parameter"))?;
+
+    let span = tracing::Span::current();
+    span.record("job_id", &job_id);
+    span.record("project_id", &project_id);
+    span.record("region", &region);
 
     // Get environment from ECS_ENVIRONMENT env var or default to "prod"
     let environment = std::env::var("ECS_ENVIRONMENT").unwrap_or_else(|_| "prod".to_string());
@@ -1038,6 +1117,8 @@ pub async fn get_job_status(payload: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("Task not found"))?;
 
     let status = task.last_status().unwrap_or("UNKNOWN");
+    span.record("task_status", &status);
+    
     let stopped_reason = task.stopped_reason().unwrap_or("");
 
     // Check for exit code of the essential container
@@ -1052,6 +1133,8 @@ pub async fn get_job_status(payload: &Value) -> Result<Value> {
             .find(|&code| code != 0)
             .unwrap_or(0)
     };
+
+    event!(Level::INFO, status = %status, exit_code = exit_code, "ECS task status retrieved");
 
     Ok(json!({
         "status": status,

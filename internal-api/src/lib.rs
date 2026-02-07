@@ -11,5 +11,6 @@ pub mod http_router;
 #[cfg(feature = "local")]
 pub mod local_setup;
 mod queries;
+pub mod otel_tracing;
 
 pub use common::CloudRuntime;

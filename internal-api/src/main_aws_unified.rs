@@ -4,16 +4,24 @@ use base64::{engine::general_purpose, Engine as _};
 use env_common::interface::initialize_project_id_and_region;
 use internal_api::aws_handlers as handlers;
 use internal_api::http_router;
+use internal_api::otel_tracing;
 use lambda_runtime::{service_fn, Error, LambdaEvent};
 use log::{debug, info, warn};
 use serde_json::Value;
 use tower_http::trace::TraceLayer;
+use tracing::{error, info_span, instrument, Span};
 
+#[instrument(skip(event), fields(request_id, user_id, http_method, http_path, event_type))]
 async fn unified_handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
-    let (payload, _context) = event.into_parts();
+    let (payload, context) = event.into_parts();
+    
+    // Record request ID for easy debugging in CloudWatch Logs Insights
+    let span = Span::current();
+    span.record("request_id", &context.request_id.as_str());
 
     // Check if this is a direct invocation (has "event" field) or API Gateway request
     if let Some(event_type) = payload.get("event").and_then(|v| v.as_str()) {
+        span.record("event_type", &event_type);
         // Direct Lambda invocation
         info!("Detected direct Lambda invocation: {}", event_type);
 
@@ -78,6 +86,11 @@ async fn unified_handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
     };
 
     info!("HTTP {} {}", http_method, uri);
+    
+    // Record HTTP context in span for debugging
+    let span = Span::current();
+    span.record("http_method", &http_method);
+    span.record("http_path", &uri.as_str());
 
     // Build Axum request
     let mut request_builder = Request::builder().method(http_method).uri(&uri);
@@ -136,6 +149,9 @@ async fn unified_handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
         if let Some(user) = maybe_user {
             info!("Authenticated user (Cognito JWT): {}", user);
             request_builder = request_builder.header("x-auth-user", user);
+            
+            // Record user ID in span for debugging
+            span.record("user_id", &user);
 
             // Add allowed_projects header if present in JWT claims
             if let Some(allowed_projects) = maybe_allowed_projects {
@@ -260,6 +276,28 @@ async fn unified_handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
             headers_map.insert(key.to_string(), Value::String(val_str.to_string()));
         }
     }
+    
+    // Add trace ID to response headers for authenticated requests only
+    // Check if request was authenticated by looking at the request context
+    let is_authenticated = payload
+        .get("requestContext")
+        .and_then(|rc| rc.get("authorizer"))
+        .is_some();
+    
+    info!("Auth check: is_authenticated={}", is_authenticated);
+    
+    if is_authenticated {
+        if let Ok(trace_id) = std::env::var("_X_AMZN_TRACE_ID") {
+            // Extract just the Root trace ID (format: Root=1-xxx-xxx;Parent=...;Sampled=...)
+            if let Some(root_part) = trace_id.split(';').next() {
+                if let Some(id) = root_part.strip_prefix("Root=") {
+                    headers_map.insert("X-Trace-Id".to_string(), Value::String(id.to_string()));
+                }
+            }
+        }
+    } else {
+        info!("Skipping X-Trace-Id header - request not authenticated");
+    }
 
     let api_gateway_response = serde_json::json!({
         "statusCode": parts.status.as_u16(),
@@ -274,12 +312,23 @@ async fn unified_handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    env_logger::init();
+    // Initialize OTEL tracing first
+    if let Err(e) = otel_tracing::init_tracing("internal-api") {
+        eprintln!("Failed to initialize OpenTelemetry: {}", e);
+        // Fall back to env_logger if OTEL init fails
+        env_logger::init();
+    }
+
     initialize_project_id_and_region().await;
 
     info!(
         "Starting unified internal-api Lambda handler (supports both direct invocation and HTTP)"
     );
 
-    lambda_runtime::run(service_fn(unified_handler)).await
+    let result = lambda_runtime::run(service_fn(unified_handler)).await;
+
+    // Shutdown tracing gracefully
+    otel_tracing::shutdown_tracing();
+
+    result
 }
