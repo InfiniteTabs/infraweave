@@ -1,8 +1,8 @@
 apiVersion: infraweave.io/v1
-kind: S3Bucket
+kind: S3BucketSimple
 metadata:
   name: bucket1a
 spec:
-  moduleVersion: 0.1.2-dev+test.10
+  moduleVersion: 1.0.0
   region: N/A
   variables: {}

@@ -8,27 +8,10 @@ use crate::interface::GenericCloudHandler;
 pub async fn insert_infra_change_record(
     handler: &GenericCloudHandler,
     infra_change_record: InfraChangeRecord,
-    plan_output_raw: &str,
 ) -> Result<String, anyhow::Error> {
-    match upload_plan_output_file(
-        handler,
-        &infra_change_record.plan_raw_json_key,
-        plan_output_raw,
-    )
-    .await
-    {
-        Ok(_) => {
-            println!("Successfully uploaded plan output file");
-        }
-        Err(e) => {
-            println!("Failed to upload plan output file: {}", e);
-        }
-    }
-
     let pk_prefix = match infra_change_record.change_type.as_str() {
-        "apply" => "APPLY",
+        "apply" | "destroy" => "MUTATE",
         "plan" => "PLAN",
-        "destroy" => "DESTROY",
         _ => "UNKNOWN",
     };
 
@@ -56,11 +39,7 @@ pub async fn insert_infra_change_record(
         infra_change_record_value
     );
 
-    let payload = serde_json::json!({
-        "event": "insert_db",
-        "table": "change_records",
-        "data": &infra_change_record_payload
-    });
+    let payload = env_defs::insert_db_event("change_records", &infra_change_record_payload);
 
     match handler.run_function(&payload).await {
         Ok(_) => Ok("".to_string()),
@@ -68,22 +47,14 @@ pub async fn insert_infra_change_record(
     }
 }
 
-async fn upload_plan_output_file<T: CloudProvider>(
+pub async fn upload_file_to_change_records<T: CloudProvider>(
     handler: &T,
     key: &str,
     content: &str,
 ) -> Result<String, anyhow::Error> {
     let base64_content = base64.encode(content);
 
-    let payload = serde_json::json!({
-        "event": "upload_file_base64",
-        "data":
-        {
-            "key": key,
-            "bucket_name": "change_records",
-            "base64_content": base64_content
-        }
-    });
+    let payload = env_defs::upload_file_base64_event(key, "change_records", &base64_content);
 
     match handler.run_function(&payload).await {
         Ok(_) => Ok("".to_string()),

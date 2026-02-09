@@ -10,6 +10,7 @@ members = [
     "gitops",
     "infraweave_py",
     "infraweave-mcp",
+    "internal-api",
     "operator",
     "prometheus_exporter",
     "reconciler",
@@ -17,6 +18,7 @@ members = [
     "utils",
     "webserver-openapi",
     "integration-tests",
+    "tofu",
 ]
 
 [workspace.package]

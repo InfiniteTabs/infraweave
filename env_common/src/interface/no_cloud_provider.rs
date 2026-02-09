@@ -39,7 +39,6 @@ impl CloudProviderCommon for NoCloudProvider {
     async fn insert_infra_change_record(
         &self,
         _record: InfraChangeRecord,
-        _raw: &str,
     ) -> Result<String, anyhow::Error> {
         Ok(String::new())
     }
@@ -165,6 +164,28 @@ impl CloudProvider for NoCloudProvider {
         _bucket: &str,
     ) -> Result<String, anyhow::Error> {
         Ok(String::new())
+    }
+
+    async fn upload_file_base64(
+        &self,
+        _key: &str,
+        _bucket: &str,
+        _base64_content: &str,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn upload_file_url(
+        &self,
+        _key: &str,
+        _bucket: &str,
+        _url: &str,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn transact_write(&self, _items: &serde_json::Value) -> Result<(), anyhow::Error> {
+        Ok(())
     }
 
     async fn get_all_latest_module(&self, _track: &str) -> Result<Vec<ModuleResp>, anyhow::Error> {

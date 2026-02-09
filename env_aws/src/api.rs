@@ -113,19 +113,22 @@ pub async fn get_lambda_client(
     project_id: &str,
     region: &str,
 ) -> (aws_sdk_lambda::Client, String) {
-    let shared_config = aws_config::from_env().load().await;
+    let region_provider = aws_config::Region::new(region.to_string());
+    let shared_config = aws_config::from_env().region(region_provider).load().await;
     match std::env::var("TEST_MODE") {
         Ok(_) => {
-            let test_region = "us-west-2";
+            let test_region = std::env::var("AWS_REGION")
+                .or_else(|_| std::env::var("TEST_REGION"))
+                .expect("AWS_REGION or TEST_REGION must be set in TEST_MODE");
             let lambda_endpoint_url =
                 lambda_endpoint_url.expect("lambda_endpoint_url variable not set");
             let test_lambda_config = aws_sdk_lambda::config::Builder::from(&shared_config)
                 .endpoint_url(lambda_endpoint_url)
-                .region(aws_config::Region::new(test_region))
+                .region(aws_config::Region::new(test_region.clone()))
                 .build();
             (
                 aws_sdk_lambda::Client::from_conf(test_lambda_config),
-                test_region.to_string(),
+                test_region,
             )
         }
         Err(_) => {
@@ -650,13 +653,7 @@ pub async fn read_db(
     project_id: &str,
     region: &str,
 ) -> Result<GenericFunctionResponse, CloudHandlerError> {
-    let full_query = json!({
-        "event": "read_db",
-        "table": table,
-        "data": {
-            "query": query
-        }
-    });
+    let full_query = env_defs::read_db_event(table, query);
     run_function(function_endpoint, &full_query, project_id, region).await
 }
 
@@ -768,20 +765,33 @@ fn _get_latest_provider_version_query(pk: &str, provider: &str) -> Value {
     })
 }
 
-pub fn get_all_latest_modules_query(track: &str) -> Value {
-    _get_all_latest_modules_query("LATEST_MODULE", track)
+pub fn get_all_latest_modules_query(
+    track: &str,
+    include_deprecated: bool,
+    include_dev000: bool,
+) -> Value {
+    _get_all_latest_modules_query("LATEST_MODULE", track, include_deprecated, include_dev000)
 }
 
-pub fn get_all_latest_stacks_query(track: &str) -> Value {
-    _get_all_latest_modules_query("LATEST_STACK", track)
+pub fn get_all_latest_stacks_query(
+    track: &str,
+    include_deprecated: bool,
+    include_dev000: bool,
+) -> Value {
+    _get_all_latest_modules_query("LATEST_STACK", track, include_deprecated, include_dev000)
 }
 
 pub fn get_all_latest_providers_query() -> Value {
     _get_all_latest_providers_query("LATEST_PROVIDER")
 }
 
-fn _get_all_latest_modules_query(pk: &str, track: &str) -> Value {
-    if track.is_empty() {
+fn _get_all_latest_modules_query(
+    pk: &str,
+    track: &str,
+    include_deprecated: bool,
+    include_dev000: bool,
+) -> Value {
+    let mut query = if track.is_empty() {
         json!({
             "KeyConditionExpression": "PK = :latest",
             "ExpressionAttributeValues": {":latest": pk},
@@ -791,7 +801,43 @@ fn _get_all_latest_modules_query(pk: &str, track: &str) -> Value {
             "KeyConditionExpression": "PK = :latest and begins_with(SK, :track)",
             "ExpressionAttributeValues": {":latest": pk, ":track": format!("MODULE#{}::", track)},
         })
+    };
+
+    let mut filters = Vec::new();
+
+    if !include_deprecated {
+        filters.push("attribute_not_exists(deprecated) OR deprecated = :false");
     }
+
+    if !include_dev000 {
+        filters.push("NOT begins_with(version, :dev_prefix)");
+    }
+
+    if !filters.is_empty() {
+        if let Some(obj) = query.as_object_mut() {
+            // Better join logic:
+            let filter_expression = filters
+                .iter()
+                .map(|f| format!("({})", f))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            obj.insert("FilterExpression".to_string(), json!(filter_expression));
+
+            if let Some(vals) = obj
+                .get_mut("ExpressionAttributeValues")
+                .and_then(|v| v.as_object_mut())
+            {
+                if !include_deprecated {
+                    vals.insert(":false".to_string(), json!(false));
+                }
+                if !include_dev000 {
+                    vals.insert(":dev_prefix".to_string(), json!("0.0.0-dev"));
+                }
+            }
+        }
+    }
+
+    query
 }
 
 fn _get_all_latest_providers_query(pk: &str) -> Value {
@@ -801,21 +847,72 @@ fn _get_all_latest_providers_query(pk: &str) -> Value {
     })
 }
 
-pub fn get_all_module_versions_query(module: &str, track: &str) -> Value {
-    _get_all_module_versions_query(module, track)
+pub fn get_all_module_versions_query(
+    module: &str,
+    track: &str,
+    include_deprecated: bool,
+    include_dev000: bool,
+) -> Value {
+    _get_all_module_versions_query(module, track, include_deprecated, include_dev000)
 }
 
-pub fn get_all_stack_versions_query(stack: &str, track: &str) -> Value {
-    _get_all_module_versions_query(stack, track)
+pub fn get_all_stack_versions_query(
+    stack: &str,
+    track: &str,
+    include_deprecated: bool,
+    include_dev000: bool,
+) -> Value {
+    _get_all_module_versions_query(stack, track, include_deprecated, include_dev000)
 }
 
-fn _get_all_module_versions_query(module: &str, track: &str) -> Value {
+fn _get_all_module_versions_query(
+    module: &str,
+    track: &str,
+    include_deprecated: bool,
+    include_dev000: bool,
+) -> Value {
+    log::info!("_get_all_module_versions_query: module={}, track={}, include_deprecated={}, include_dev000={}", module, track, include_deprecated, include_dev000);
     let id: String = format!("MODULE#{}", get_module_identifier(module, track));
-    json!({
+    let mut query = json!({
         "KeyConditionExpression": "PK = :module AND begins_with(SK, :sk)",
         "ExpressionAttributeValues": {":module": id, ":sk": "VERSION#"},
         "ScanIndexForward": false,
-    })
+    });
+
+    let mut filters = Vec::new();
+
+    if !include_deprecated {
+        filters.push("attribute_not_exists(deprecated) OR deprecated = :false");
+    }
+
+    if !include_dev000 {
+        filters.push("NOT begins_with(version, :dev_prefix)");
+    }
+
+    if !filters.is_empty() {
+        if let Some(obj) = query.as_object_mut() {
+            let filter_expression = filters
+                .iter()
+                .map(|f| format!("({})", f))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            obj.insert("FilterExpression".to_string(), json!(filter_expression));
+
+            if let Some(vals) = obj
+                .get_mut("ExpressionAttributeValues")
+                .and_then(|v| v.as_object_mut())
+            {
+                if !include_deprecated {
+                    vals.insert(":false".to_string(), json!(false));
+                }
+                if !include_dev000 {
+                    vals.insert(":dev_prefix".to_string(), json!("0.0.0-dev"));
+                }
+            }
+        }
+    }
+
+    query
 }
 
 pub fn get_module_version_query(module: &str, track: &str, version: &str) -> Value {
@@ -828,34 +925,18 @@ pub fn get_module_version_query(module: &str, track: &str, version: &str) -> Val
     })
 }
 
+pub fn get_provider_version_query(provider: &str, version: &str) -> Value {
+    let id: String = format!("PROVIDER#{}", provider);
+    let version_id = format!("VERSION#{}", zero_pad_semver(version, 3).unwrap());
+    json!({
+        "KeyConditionExpression": "PK = :provider AND SK = :sk",
+        "ExpressionAttributeValues": {":provider": id, ":sk": version_id},
+        "Limit": 1,
+    })
+}
+
 pub fn get_stack_version_query(module: &str, track: &str, version: &str) -> Value {
     get_module_version_query(module, track, version)
-}
-
-pub fn get_generate_presigned_url_query(key: &str, bucket: &str) -> Value {
-    json!({
-        "event": "generate_presigned_url",
-            "data":{
-            "key": key,
-            "bucket_name": bucket,
-            "expires_in": 60,
-        }
-    })
-}
-
-pub fn get_job_status_query(job_id: &str) -> Value {
-    json!({
-        "event": "get_job_status",
-        "data": {
-            "job_id": job_id
-        }
-    })
-}
-
-pub fn get_environment_variables_query() -> Value {
-    json!({
-        "event": "get_environment_variables"
-    })
 }
 
 pub fn get_all_deployments_query(
@@ -1004,6 +1085,68 @@ pub fn get_plan_deployment_query(
     })
 }
 
+pub fn get_deployment_history_plans_query(
+    project_id: &str,
+    region: &str,
+    environment: Option<&str>,
+) -> Value {
+    // Use DeletedIndex to query plans by deleted_PK_base and PK prefix
+    let deleted_pk_base = format!("0|PLAN#{}::{}", project_id, region);
+    let pk_prefix = if let Some(env) = environment {
+        format!(
+            "PLAN#{}",
+            get_deployment_identifier(project_id, region, "", env)
+        )
+    } else {
+        format!("PLAN#{}::{}", project_id, region)
+    };
+
+    json!({
+        "IndexName": "DeletedIndex",
+        "KeyConditionExpression": "deleted_PK_base = :deleted_pk_base AND begins_with(PK, :pk_prefix)",
+        "ExpressionAttributeValues": {
+            ":deleted_pk_base": deleted_pk_base,
+            ":pk_prefix": pk_prefix,
+        },
+    })
+}
+
+pub fn get_deployment_history_deleted_query(
+    project_id: &str,
+    region: &str,
+    environment: Option<&str>,
+) -> Value {
+    // Use DeletedIndex with exact match on deleted_PK_base and begins_with on PK
+    let deleted_pk_base = format!("1|DEPLOYMENT#{}::{}", project_id, region);
+
+    let mut query = json!({
+        "IndexName": "DeletedIndex",
+        "KeyConditionExpression": "deleted_PK_base = :deleted_pk_base",
+        "FilterExpression": "SK = :metadata",
+        "ExpressionAttributeValues": {
+            ":deleted_pk_base": deleted_pk_base,
+            ":metadata": "METADATA",
+        },
+    });
+
+    // If environment is specified, add it to FilterExpression
+    if let Some(env) = environment {
+        let pk_prefix = format!(
+            "DEPLOYMENT#{}",
+            get_deployment_identifier(project_id, region, "", env)
+        );
+        query["FilterExpression"] = json!("SK = :metadata AND begins_with(PK, :pk_prefix)");
+        if let Some(values) = query
+            .get_mut("ExpressionAttributeValues")
+            .and_then(|v| v.as_object_mut())
+        {
+            values.insert(":pk_prefix".to_string(), json!(pk_prefix));
+        }
+    }
+
+    query
+}
+
 pub fn get_dependents_query(
     project_id: &str,
     region: &str,
@@ -1060,11 +1203,48 @@ pub fn get_events_query(
     region: &str,
     deployment_id: &str,
     environment: &str,
+    event_type: Option<&str>,
 ) -> Value {
-    json!({
+    let mut query = json!({
         "KeyConditionExpression": "PK = :pk",
-        "ExpressionAttributeValues": {":pk": format!("EVENT#{}", get_event_identifier(project_id, region, deployment_id, environment))}
-    })
+        "ExpressionAttributeValues": {":pk": format!("EVENT#{}", get_event_identifier(project_id, region, deployment_id, environment))},
+        "ScanIndexForward": false
+    });
+
+    if let Some(etype) = event_type {
+        if etype == "mutate" {
+            query["FilterExpression"] = json!("#event = :apply OR #event = :destroy");
+            query["ExpressionAttributeNames"] = json!({"#event": "event"});
+            if let Some(values) = query
+                .get_mut("ExpressionAttributeValues")
+                .and_then(|v| v.as_object_mut())
+            {
+                values.insert(":apply".to_string(), json!("apply"));
+                values.insert(":destroy".to_string(), json!("destroy"));
+            }
+        } else if etype == "plan" {
+            query["FilterExpression"] = json!("#event = :plan");
+            query["ExpressionAttributeNames"] = json!({"#event": "event"});
+            if let Some(values) = query
+                .get_mut("ExpressionAttributeValues")
+                .and_then(|v| v.as_object_mut())
+            {
+                values.insert(":plan".to_string(), json!("plan"));
+            }
+        } else if !etype.is_empty() {
+            query["FilterExpression"] = json!("#event = :event");
+            query["ExpressionAttributeNames"] = json!({"#event": "event"});
+
+            if let Some(values) = query
+                .get_mut("ExpressionAttributeValues")
+                .and_then(|v| v.as_object_mut())
+            {
+                values.insert(":event".to_string(), json!(etype));
+            }
+        }
+    }
+
+    query
 }
 
 pub fn get_all_events_between_query(region: &str, start_epoch: u128, end_epoch: u128) -> Value {

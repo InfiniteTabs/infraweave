@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod auth;
 pub mod claim;
 pub mod deployment;
 pub mod gitops;

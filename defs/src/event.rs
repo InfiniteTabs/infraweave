@@ -30,6 +30,7 @@ pub struct EventData {
     pub next_drift_check_epoch: i128,
     pub has_drifted: bool,
     pub module: String,
+    pub module_version: String,
     pub name: String,
     pub status: String,
     pub timestamp: String,

@@ -71,6 +71,9 @@ enum Commands {
         /// Environment id used when planning, e.g. cli/default (optional, will prompt if not provided)
         #[arg(short, long)]
         environment_id: Option<String>,
+        /// Project ID (AWS account ID) for HTTP mode
+        #[arg(short, long)]
+        project: Option<String>,
         /// Flag to indicate if output files should be stored
         #[arg(long)]
         store_files: bool,
@@ -88,6 +91,9 @@ enum Commands {
         /// Environment id used when checking drift, e.g. cli/default (optional, will prompt if not provided)
         #[arg(short, long)]
         environment_id: Option<String>,
+        /// Project ID (AWS account ID) for HTTP mode
+        #[arg(short, long)]
+        project: Option<String>,
         /// Flag to indicate if remediate should be performed
         #[arg(long)]
         remediate: bool,
@@ -99,6 +105,9 @@ enum Commands {
         /// Environment id used when applying, e.g. cli/default (optional, will prompt if not provided)
         #[arg(short, long)]
         environment_id: Option<String>,
+        /// Project ID (AWS account ID) for HTTP mode
+        #[arg(short, long)]
+        project: Option<String>,
         /// Flag to indicate if output files should be stored
         #[arg(long)]
         store_files: bool,
@@ -113,6 +122,9 @@ enum Commands {
         /// Environment id where the deployment exists, e.g. cli/default (optional, will prompt if not provided)
         #[arg(short, long)]
         environment_id: Option<String>,
+        /// Project ID (AWS account ID) for HTTP mode
+        #[arg(long)]
+        project: Option<String>,
         /// Optional override version of module/stack used during destroy
         #[arg(short, long)]
         version: Option<String>,
@@ -152,6 +164,12 @@ enum Commands {
     },
     /// Launch interactive TUI for exploring modules and deployments
     Ui,
+    /// Authenticate with InfraWeave API using AWS IAM credentials
+    Login {
+        /// API endpoint URL (e.g., https://api.example.com/v1) or use INFRAWEAVE_API_ENDPOINT env var
+        #[arg(short, long)]
+        api_endpoint: Option<String>,
+    },
     /// Start MCP (Model Context Protocol) server for AI tool integration
     #[command(
         about = "MCP server commands for AI tools like Claude Desktop, VSCode Copilot, etc."
@@ -445,7 +463,14 @@ enum GitopsCommands {
 #[derive(Subcommand)]
 enum DeploymentCommands {
     /// List all deployments for a specific environment
-    List,
+    List {
+        /// Project ID to list deployments from (required in HTTP mode)
+        #[arg(long)]
+        project: Option<String>,
+        /// AWS region (defaults to current region)
+        #[arg(long)]
+        region: Option<String>,
+    },
     /// Describe a specific deployment
     Describe {
         /// Environment id where the deployment exists, e.g. cli/default (optional, will prompt if not provided)
@@ -480,10 +505,24 @@ enum AdminCommands {
 async fn main() {
     let cli = Cli::parse();
 
+    // Extract project flag early and set environment variable before initialization
+    match &cli.command {
+        Commands::Plan { project, .. }
+        | Commands::Apply { project, .. }
+        | Commands::Driftcheck { project, .. }
+        | Commands::Destroy { project, .. } => {
+            if let Some(project_id) = project {
+                std::env::set_var("INFRAWEAVE_PROJECT_ID", project_id);
+            }
+        }
+        _ => {}
+    }
+
     // Skip initialization for documentation generation and MCP server
     // MCP uses stdio for JSON-RPC, so initialization logging would interfere
     let skip_init = matches!(cli.command, Commands::GenerateDocs)
         || matches!(cli.command, Commands::Upgrade { .. })
+        || matches!(cli.command, Commands::Login { .. })
         || matches!(cli.command, Commands::Mcp { command: None })
         || matches!(
             cli.command,
@@ -500,6 +539,8 @@ async fn main() {
 
     if !skip_init {
         setup_logging().unwrap();
+
+        // Always initialize - AWS SDK calls will be skipped automatically in HTTP mode
         initialize_project_id_and_region().await;
     }
 
@@ -671,6 +712,7 @@ async fn main() {
         Commands::Plan {
             environment_id,
             claim,
+            project: _,
             store_files,
             destroy,
             follow,
@@ -682,6 +724,7 @@ async fn main() {
         Commands::Driftcheck {
             environment_id,
             deployment_id,
+            project: _,
             remediate,
         } => {
             let (environment_id, deployment_id) =
@@ -692,6 +735,7 @@ async fn main() {
         Commands::Apply {
             environment_id,
             claim,
+            project: _,
             store_files,
             follow,
         } => {
@@ -702,6 +746,7 @@ async fn main() {
         Commands::Destroy {
             environment_id,
             deployment_id,
+            project: _,
             version,
             store_files,
             follow,
@@ -719,8 +764,8 @@ async fn main() {
             .await;
         }
         Commands::Deployments { command } => match command {
-            DeploymentCommands::List => {
-                commands::deployment::handle_list().await;
+            DeploymentCommands::List { project, region } => {
+                commands::deployment::handle_list(project.as_deref(), region.as_deref()).await;
             }
             DeploymentCommands::Describe {
                 environment_id,
@@ -757,7 +802,21 @@ async fn main() {
         },
         Commands::Ui => {
             if let Err(e) = run_tui().await {
-                eprintln!("Error running TUI: {}", e);
+                eprintln!("Error running TUI: {:?}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Login { api_endpoint } => {
+            // Get endpoint from argument or environment variable
+            let endpoint = api_endpoint.or_else(|| {
+                std::env::var("INFRAWEAVE_API_ENDPOINT").ok()
+            }).unwrap_or_else(|| {
+                eprintln!("Error: API endpoint must be provided via --api-endpoint or INFRAWEAVE_API_ENDPOINT environment variable");
+                std::process::exit(1);
+            });
+
+            if let Err(e) = commands::auth::execute_login(endpoint).await {
+                eprintln!("Login failed: {}", e);
                 std::process::exit(1);
             }
         }
@@ -847,6 +906,9 @@ async fn run_tui() -> anyhow::Result<()> {
     let mut app = cli::tui::App::new();
     let (bg_sender, mut bg_receiver) = cli::tui::background::create_channel();
     app.set_background_sender(bg_sender);
+
+    // Preload projects in background to speed up Deployments view
+    app.preload_projects();
 
     // Main loop
     loop {
