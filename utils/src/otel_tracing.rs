@@ -1,9 +1,10 @@
+use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 use std::io::IsTerminal;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::layer::SubscriberExt;
@@ -24,10 +25,9 @@ pub fn init_tracing(service_name: &str) -> anyhow::Result<()> {
     let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .unwrap_or_else(|_| "http://localhost:4317".to_string());
 
-    let resource = Resource::new(vec![KeyValue::new(
-        "service.name",
-        service_name.to_string(),
-    )]);
+    let resource = Resource::builder()
+        .with_service_name(service_name.to_string())
+        .build();
 
     let telemetry_layer = match opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
@@ -36,12 +36,15 @@ pub fn init_tracing(service_name: &str) -> anyhow::Result<()> {
         .build()
     {
         Ok(exporter) => {
-            let provider = TracerProvider::builder()
+            let provider = SdkTracerProvider::builder()
                 .with_resource(resource)
-                .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+                .with_batch_exporter(exporter)
                 .build();
             global::set_tracer_provider(provider.clone());
             let tracer = provider.tracer(service_name.to_string());
+            // Hold onto the provider so `shutdown_tracing` can flush it —
+            // `global::shutdown_tracer_provider` was removed in 0.28.
+            let _ = TRACER_PROVIDER.set(provider);
             Some(tracing_opentelemetry::layer().with_tracer(tracer))
         }
         Err(e) => {
@@ -94,7 +97,14 @@ pub fn init_tracing(service_name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Holds the SDK tracer provider so `shutdown_tracing` can flush it at exit.
+static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
+
 /// Flush and shut down the global tracer provider. Call once at process exit.
 pub fn shutdown_tracing() {
-    global::shutdown_tracer_provider();
+    if let Some(provider) = TRACER_PROVIDER.get() {
+        if let Err(e) = provider.shutdown() {
+            eprintln!("OpenTelemetry tracer provider shutdown failed: {}", e);
+        }
+    }
 }
